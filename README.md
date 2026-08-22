@@ -1,6 +1,8 @@
 # omarchy-agent-collectors
 
 Extensible usage collectors for AI coding agents on [Omarchy](https://omarchy.org).
+
+![The omarchy.agents panel showing Claude, OpenCode, and Pi tabs](preview.png)
 One engine, many drop-in adapters. Writes stock-contract records into
 `~/.local/state/omarchy/agents/usage/`, where Omarchy's built-in
 `omarchy.agents` bar panel picks them up automatically — no UI code involved.
@@ -30,9 +32,9 @@ rm -rf ~/.cache/omarchy/agent-collectors
 ## How it works
 
 ```
-adapters/<id>/manifest.json   declarative source + field map  ┐
-~/.config/omarchy/agent-collectors/adapters/<id>/…            ├→ engine → ~/.local/state/omarchy/agents/usage/<id>.json
-(optional) collect/limits hooks                                ┘
+adapters/<id>/manifest.json   declarative source + field map ┐
+~/.config/omarchy/agent-collectors/adapters/<id>/…           ├→ engine → ~/.local/state/omarchy/agents/usage/<id>.json
+(optional) collect/limits hooks                              ┘
 ```
 
 Per run the engine:
