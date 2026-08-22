@@ -110,6 +110,34 @@ manifest and reference them:
 Validate your setup with `bin/agent-collectors --validate`. A broken adapter
 is skipped with a warning; it can never take other agents down.
 
+## Resource bounds
+
+The engine keeps memory and persistent state bounded by caps, never by
+history size.
+
+- State holds per-file append cursors and per-adapter counters only; event
+  lists are never stored or re-read.
+- JSONL files are read append-only from the last byte offset; a truncated or
+  rotated file triggers a full rescan. A mid-file rewrite that grows the file
+  is not detected (JSONL session logs are append-only in practice).
+- SQLite reads stream row by row; with a `ts` column only rows newer than the
+  last seen timestamp are fetched (adapter queries SHOULD `ORDER BY` the
+  timestamp column).
+- Hook stdout is streamed and capped: 100,000 lines for `collect`, 1 MiB for
+  `limits`; hook stderr is capped at 1 MiB. A hook that exceeds a cap is
+  killed and its partial events are kept; other adapters are unaffected.
+- The service streams engine stderr line by line with a 1 MiB cap instead of
+  buffering it to process end.
+- Session ids: the newest 10,000 are kept per adapter; beyond that
+  `totalSessions` is the stored count plus the evicted count (approximate).
+- Model buckets: 50 per adapter; further models roll into `other`.
+- Active dates: 730 days are kept; older ones still count toward `activeDays`.
+- A state file larger than 64 MiB is ignored and rebuilt by a one-time full
+  rescan. This also migrates pre-v2 state: totals are rebuilt from the session
+  files, so no history is lost unless the files are gone.
+- Crash window: state is saved before each adapter's record. A crash in
+  between can double-count that adapter's appended bytes on the next run.
+
 ## Notes
 
 - Rate-limit meters only appear for adapters with a working `limits` hook;
