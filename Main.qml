@@ -26,12 +26,12 @@ Item {
     stderr: SplitParser {
       id: errParser
       onRead: function(data) {
-        if (root.errBytes > root.maxErrBytes) {
+        if (collectorProcess.errBytes > collectorProcess.maxErrBytes) {
           collectorProcess.stderr = null
           console.warn("agent-collectors", "stderr cap exceeded; detached")
           return
         }
-        root.errBytes += data.length
+        collectorProcess.errBytes += data.length
         if (data.trim() !== "") console.warn("agent-collectors", data.trim())
       }
     }
@@ -60,11 +60,9 @@ Item {
 
   function run() {
     if (collectorProcess.running) return
+    collectorProcess.errBytes = 0
+    if (collectorProcess.stderr === null) collectorProcess.stderr = errParser
     collectorProcess.command = [root.engine]
     collectorProcess.running = true
-  }
-
-  Component.onCompleted: {
-    if (!Quickshell.env("HOME")) return
   }
 }

@@ -6,9 +6,10 @@ data; the engine normalizes it into canonical events, aggregates them, and
 writes one stock-contract JSON record per agent into
 ~/.local/state/omarchy/agents/usage/ where the omarchy.agents panel watches.
 
-Memory model: bounded. State never stores event lists — only per-file append
-cursors, per-source last-timestamp cursors, and per-adapter counter blocks.
-Each run holds at most the events produced since the previous run.
+Memory model: bounded and streamed. State stores per-file append cursors,
+per-source last-timestamp cursors, and per-adapter counter blocks only.
+Collectors yield events one at a time into the accumulator; no event list is
+materialized in memory, regardless of history size.
 
 Usage:
   agent-collectors [--force] [--except <id>] ... [<id> ...]
@@ -20,7 +21,9 @@ Exit codes: 0 ok, 1 at least one adapter failed.
 from __future__ import annotations
 
 import argparse
+import base64
 import bisect
+import copy
 import glob as globmod
 import json
 import os
@@ -47,7 +50,7 @@ OMARCHY_BIN = os.path.join(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"),
 BUILTIN_ADAPTERS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "adapters"))
 
 SCHEMA_VERSION = 1  # record contract version (what the panel consumes)
-STATE_SCHEMA_VERSION = 2  # engine state version
+STATE_SCHEMA_VERSION = 3  # engine state version
 
 # ---------------------------------------------------------------- caps
 
@@ -60,8 +63,11 @@ STATE_LOAD_GUARD = 64 * 1024 * 1024  # state files larger than this are ignored
 HOOK_TIMEOUT_S = 120           # collect hook timeout
 LIMITS_TIMEOUT_S = 30          # limits hook timeout
 HOOK_EVENT_CAP = 100_000       # max stdout lines read from a collect hook
-HOOK_STDOUT_CAP = 1024 * 1024  # max stdout bytes read from a limits hook
+HOOK_STDOUT_CAP = 1024 * 1024  # max stdout bytes read from a hook (lines or doc)
 HOOK_STDERR_CAP = 1024 * 1024  # max stderr bytes spooled from a hook
+HOOK_FP_CAP = 50_000           # max hook event fingerprints kept per adapter
+PARTIAL_CAP = 8192             # max straddle-line tail bytes kept per jsonl file
+HEAD_LEN = 64                  # first bytes fingerprinted to detect file replacement
 
 
 def log(msg: str) -> None:
@@ -150,6 +156,39 @@ def file_ends_newline(path: str, size: int) -> bool:
         return False
 
 
+def file_partial(path: str, size: int, cap: int = PARTIAL_CAP) -> str:
+    """Unterminated tail: text after the last newline ("" when none)."""
+    if size <= 0:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - cap))
+            data = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    idx = data.rfind("\n")
+    return data[idx + 1:] if idx != -1 else data
+
+
+def file_head(path: str, size: int) -> str:
+    """Base64 of the first HEAD_LEN bytes; detects file replacement."""
+    if size <= 0:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            return base64.b64encode(fh.read(HEAD_LEN)).decode()
+    except OSError:
+        return ""
+
+
+def event_fp(ev: dict) -> str:
+    """Fingerprint of a canonical event; used for hook dedupe."""
+    import hashlib
+    raw = json.dumps([ev["ts"], ev["session"], ev["model"], ev["kind"],
+                      ev["input"], ev["output"], ev["cacheRead"], ev["cacheWrite"]])
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+
 # ------------------------------------------------- jsonl-lines collector
 
 def jsonl_line_to_event(obj: dict, cfg: dict, path: str) -> dict | None:
@@ -176,19 +215,21 @@ def jsonl_line_to_event(obj: dict, cfg: dict, path: str) -> dict | None:
     return None
 
 
-def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
-    """Return events new since the last run. Cache holds cursors only.
+def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool):
+    """Yield events new since the last run. Cache holds cursors only.
 
-    Cache entry per file: {"sig": {size, mtime_ns}, "offset": bytes, "newline": bool}.
+    Cache entry per file: {"sig", "offset", "newline", "partial", "head"}.
     Unchanged file -> skipped. Grown file -> only the appended bytes are parsed
     (append-only assumption; a mid-file rewrite that grows the file is not
-    detected). Shrunk/rotated file -> full rescan from offset 0.
+    detected, unless the head fingerprint changes, which forces a full
+    rescan). Shrunk/rotated file -> full rescan from offset 0. A stored
+    straddle tail is re-attached to the first line of the new chunk. Events
+    are yielded one at a time; nothing accumulates.
     """
     files = sorted(set(globmod.glob(expand(source["glob"]), recursive=True)))
     cache_key = f"jsonl:{source['glob']}"
     cache = state.get(cache_key) if isinstance(state.get(cache_key), dict) else {}
     new_cache = {}
-    events = []
     cfg = {
         "kinds": set(source.get("kinds") or []),
         "kindPath": source.get("kindPath", ""),
@@ -211,21 +252,27 @@ def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool
         if not force and isinstance(cached, dict) and cached.get("sig") == sig:
             new_cache[path] = cached
             continue
-        file_events = []
         append_only = (not force and isinstance(cached, dict)
-                       and st.st_size >= cached.get("offset", 0))
+                       and st.st_size >= cached.get("offset", 0)
+                       and file_head(path, st.st_size) == cached.get("head", None))
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                partial = ""
                 skip_first = False
                 if append_only:
                     fh.seek(cached.get("offset", 0))
-                    # first line of the new chunk continues an unterminated last line
-                    skip_first = cached.get("offset", 0) > 0 and not cached.get("newline", True)
+                    if "partial" in cached:
+                        partial = cached["partial"]
+                    else:  # legacy entry: fall back to the skip heuristic
+                        skip_first = cached.get("offset", 0) > 0 and not cached.get("newline", True)
                 first = True
                 for line in fh:
                     if first:
                         first = False
-                        if skip_first:  # continuation of an unterminated last line
+                        if partial:
+                            line = partial + line  # re-attach the straddle tail
+                            partial = ""
+                        elif skip_first:  # legacy: continuation of an unterminated last line
                             continue
                     line = line.strip()
                     if not line:
@@ -236,18 +283,18 @@ def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool
                         continue
                     ev = jsonl_line_to_event(obj, cfg, path)
                     if ev:
-                        file_events.append(ev)
+                        yield ev
         except OSError as e:
             log(f"{path}: {e}")
             if isinstance(cached, dict):
                 new_cache[path] = cached  # retry next run
             continue
         new_cache[path] = {"sig": sig, "offset": st.st_size,
-                           "newline": file_ends_newline(path, st.st_size)}
-        events.extend(file_events)
+                           "newline": file_ends_newline(path, st.st_size),
+                           "partial": file_partial(path, st.st_size),
+                           "head": file_head(path, st.st_size)}
 
     state[cache_key] = new_cache
-    return events
 
 
 # ---------------------------------------------- sqlite-query collector
@@ -259,9 +306,12 @@ def db_sig(db_path: str):
         return None
     sig = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
     wal = db_path + "-wal"
-    if os.path.exists(wal):
-        ws = os.stat(wal)
-        sig["wal"] = [ws.st_size, ws.st_mtime_ns]
+    try:
+        if os.path.exists(wal):
+            ws = os.stat(wal)
+            sig["wal"] = [ws.st_size, ws.st_mtime_ns]
+    except OSError:
+        pass  # WAL checkpointed between exists() and stat()
     return sig
 
 
@@ -270,14 +320,16 @@ def hashlib_key(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:12]
 
 
-def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
-    """Return rows new since the last run, streamed row by row.
+def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: bool):
+    """Yield rows new since the last run, streamed row by row.
 
-    Cache entry: {"sig", "lastTs"} — never event lists. With a ts column the
-    user query is wrapped as SELECT * FROM (<query>) WHERE "<ts>" > ? so only
-    new rows are fetched. Requires ascending ts order in the query (adapter
-    queries SHOULD ORDER BY the timestamp column). Without a ts column a full
-    streaming rescan runs on every signature change.
+    Cache entry: {"sig", "lastTs", "boundary"} — never event lists. With a ts
+    column the user query is wrapped as SELECT * FROM (<query>) WHERE "<ts>"
+    >= ? so only new rows are fetched; rows sharing the boundary timestamp are
+    deduplicated by fingerprint. Requires ascending ts order in the query
+    (adapter queries SHOULD ORDER BY the timestamp column). Without a ts
+    column a full streaming rescan runs on every signature change. Rows are
+    yielded one at a time; nothing accumulates.
     """
     db_path = expand(source["database"])
     query = source["query"]
@@ -292,18 +344,22 @@ def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: boo
 
     ts_col = cols.get("ts", "")
     last_ts = cached.get("lastTs") if (not force and isinstance(cached, dict)) else None
+    boundary_fps = set(cached.get("boundary") or []) if not force else set()
     run_query, params = query, ()
     if ts_col and last_ts is not None:
-        run_query = f'SELECT * FROM ({query}) WHERE "{ts_col}" > ?'
+        quoted = ts_col.replace('"', '""')
+        run_query = f'SELECT * FROM ({query}) WHERE "{quoted}" >= ?'
         params = (last_ts,)
 
-    events = []
     max_raw = last_ts
+    new_boundary: list[str] = []
     uri = f"file:{db_path}?mode=ro"
     try:
         con = sqlite3.connect(uri, uri=True)
         try:
             cur = con.execute(run_query, params)
+            if cur.description is None:
+                raise RuntimeError(f"sqlite {db_path}: query returned no columns")
             names = [d[0] for d in cur.description]
             for row in cur:  # streamed; rows are never materialized
                 row = dict(zip(names, row))
@@ -326,15 +382,22 @@ def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: boo
                     row.get(cols.get("cacheWrite", ""), 0) if kind == "completion" else 0,
                     unit,
                 )
-                if ev:
-                    events.append(ev)
+                if not ev:
+                    continue
+                if boundary_fps and event_fp(ev) in boundary_fps:
+                    continue  # already merged at the boundary timestamp
+                if ts_col and raw is not None and max_raw is not None and raw == max_raw:
+                    new_boundary.append(event_fp(ev))
+                    if len(new_boundary) > 10_000:
+                        new_boundary.pop(0)
+                yield ev
         finally:
             con.close()
     except sqlite3.Error as e:
         raise RuntimeError(f"sqlite {db_path}: {e}")
 
-    state[cache_key] = {"sig": sig, "lastTs": max_raw}
-    return events
+    state[cache_key] = {"sig": sig, "lastTs": max_raw,
+                        "boundary": new_boundary if ts_col else []}
 
 
 # ------------------------------------------------------- hook collector
@@ -390,48 +453,58 @@ def _hook_run(script: str, adapter_dir: str, timeout: float, env_extra: dict | N
     lines: list[str] = []
     raw_out = bytearray()
     status = "ok"
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_group(proc)
-            status = "timeout"
-            break
-        if not sel.select(min(remaining, 1.0)):
-            continue
-        chunk = os.read(proc.stdout.fileno(), 65536)
-        if not chunk:
-            break
-        if max_bytes is not None:
-            if len(raw_out) + len(chunk) > max_bytes:
-                raw_out.extend(chunk[: max_bytes - len(raw_out)])
-                _kill_group(proc)
-                status = "capped"
-                break
-            raw_out.extend(chunk)
-        else:
-            buf += chunk
-            while b"\n" in buf:
-                raw, buf = buf.split(b"\n", 1)
-                line = raw.decode("utf-8", "replace").strip()
-                if line:
-                    lines.append(line)
-                    if max_lines is not None and len(lines) >= max_lines:
-                        _kill_group(proc)
-                        status = "capped"
-                        break
-            if status == "capped":
-                break
-    if max_bytes is None and buf.strip():
-        lines.append(buf.decode("utf-8", "replace").strip())
     try:
-        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
-        proc.wait()
-        status = "timeout"
-    stderr_thread.join()
-    proc.stdout.close()
-    proc.stderr.close()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_group(proc)
+                status = "timeout"
+                break
+            if not sel.select(min(remaining, 1.0)):
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            if max_bytes is not None:
+                if len(raw_out) + len(chunk) > max_bytes:
+                    raw_out.extend(chunk[: max_bytes - len(raw_out)])
+                    _kill_group(proc)
+                    status = "capped"
+                    break
+                raw_out.extend(chunk)
+            else:
+                buf += chunk
+                if len(buf) > HOOK_STDOUT_CAP:
+                    _kill_group(proc)
+                    status = "capped"
+                    break
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        lines.append(line)
+                        if max_lines is not None and len(lines) >= max_lines:
+                            _kill_group(proc)
+                            status = "capped"
+                            break
+                if status == "capped":
+                    break
+        if max_bytes is None and buf.strip():
+            lines.append(buf.decode("utf-8", "replace").strip())
+    finally:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            proc.wait()
+            status = "timeout"
+        stderr_thread.join(timeout=5)
+        for fd in (proc.stdout, proc.stderr):
+            try:
+                fd.close()
+            except OSError:
+                pass
+        sel.close()
     spool.seek(0)
     stderr_tail = spool.read(HOOK_STDERR_CAP).decode("utf-8", "replace")
     spool.close()
@@ -439,10 +512,11 @@ def _hook_run(script: str, adapter_dir: str, timeout: float, env_extra: dict | N
     return status, output, stderr_tail, stderr_capped["v"], proc.returncode
 
 
-def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
+def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool):
+    """Yield events parsed from a collect hook's stdout, one at a time."""
     script = adapter.get("collect")
     if not script:
-        return []
+        return
     status, output, stderr_tail, stderr_capped, returncode = _hook_run(
         script, adapter_dir, HOOK_TIMEOUT_S, {"FORCE": "1" if force else ""},
         max_lines=HOOK_EVENT_CAP,
@@ -455,7 +529,6 @@ def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool) -> l
         log(f"{adapter['id']} collect hook: stdout capped at {HOOK_EVENT_CAP} lines")
     elif returncode != 0:
         raise RuntimeError(f"collect hook failed: {stderr_tail.strip()[:300]}")
-    events = []
     for line in output:
         try:
             obj = json.loads(line)
@@ -465,8 +538,7 @@ def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool) -> l
                         obj.get("kind"), obj.get("input"), obj.get("output"),
                         obj.get("cacheRead"), obj.get("cacheWrite"))
         if ev:
-            events.append(ev)
-    return events
+            yield ev
 
 
 COLLECTORS = {
@@ -486,7 +558,30 @@ def fresh_stats() -> dict:
         "today": {"day": "", "prompts": 0, "tokens": 0,
                   "sessions": [], "sessionsEvicted": 0, "tokensByModel": {}},
         "days": {},
+        "hookFp": [],
     }
+
+
+def merge_hook_events(stats: dict, events, now: datetime | None = None) -> int:
+    """Merge hook events, skipping fingerprints already merged before.
+
+    Hooks are stateless and may re-emit their full history; the per-adapter
+    fingerprint list (capped) makes each distinct event count once. The
+    intermediate list is bounded by the hook output cap.
+    """
+    fps = set(stats["hookFp"])
+    fresh = []
+    for ev in events:
+        fp = event_fp(ev)
+        if fp in fps:
+            continue
+        fresh.append(ev)
+        fps.add(fp)
+        stats["hookFp"].append(fp)
+        if len(stats["hookFp"]) > HOOK_FP_CAP:
+            del stats["hookFp"][: len(stats["hookFp"]) - HOOK_FP_CAP]
+            fps = set(stats["hookFp"])
+    return merge_events(stats, fresh, now=now)
 
 
 def _model_key(mapping: dict, model: str) -> str:
@@ -495,8 +590,12 @@ def _model_key(mapping: dict, model: str) -> str:
     return "other"
 
 
-def merge_events(stats: dict, events: list[dict], now: datetime | None = None) -> None:
-    """Merge new events into a counter block. Memory is bounded by caps."""
+def merge_events(stats: dict, events, now: datetime | None = None) -> int:
+    """Merge an iterable of events into a counter block; return event count.
+
+    Consumes the iterable inline (generators included); memory is bounded by
+    caps plus one event.
+    """
     now = now or datetime.now()
     today = now.strftime("%Y-%m-%d")
     t = stats["today"]
@@ -512,6 +611,7 @@ def merge_events(stats: dict, events: list[dict], now: datetime | None = None) -
     active_dates = stats["activeDates"]
     t_sessions = t["sessions"]
     t_sessions_seen = set(t_sessions)
+    merged = 0
 
     for ev in events:
         d = day_key(ev["ts"])
@@ -555,6 +655,8 @@ def merge_events(stats: dict, events: list[dict], now: datetime | None = None) -
                 else:
                     t["sessionsEvicted"] += 1
                 t_sessions_seen.add(sid)
+        merged += 1
+    return merged
 
 
 # -------------------------------------------------------------- records
@@ -738,7 +840,7 @@ def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> list:
 # ---------------------------------------------------------------- main
 
 def load_state() -> dict:
-    """Load v2 state. v1 or oversized state is ignored: one full rescan
+    """Load v3 state. Older or oversized state is ignored: one full rescan
     rebuilds all counters, so no history is lost and no unbounded allocation
     happens during the upgrade."""
     try:
@@ -812,28 +914,37 @@ def main(argv=None) -> int:
             continue
         ran_any = True
         try:
-            events = []
+            all_stats = state.setdefault("stats", {})
+            if args.force or aid not in all_stats:  # force rebuilds from the full scan
+                stats = fresh_stats()
+            else:
+                stats = copy.deepcopy(all_stats[aid])
+            run_state = {"stats": state["stats"]}  # cursor caches staged here
+            for key, value in state.items():
+                if key != "stats":
+                    run_state[key] = value  # previous cursors visible to collectors
+            merged = 0
             for source in manifest.get("sources") or []:
                 fn = COLLECTORS[source["format"]]
-                events.extend(fn(source, adapter_dir, state, args.force))
+                merged += merge_events(stats, fn(source, adapter_dir, run_state, args.force))
             hook = manifest.get("collect")
             if hook:
-                events.extend(collect_hook({**manifest, "collect": hook}, adapter_dir, state, args.force))
-            all_stats = state.setdefault("stats", {})
-            stats = all_stats.get(aid)
-            if stats is None or args.force:  # force rebuilds counters from the full scan
-                stats = fresh_stats()
-                all_stats[aid] = stats
-            merge_events(stats, events)
+                merged += merge_hook_events(stats, collect_hook(
+                    {**manifest, "collect": hook}, adapter_dir, run_state, args.force))
             record = build_record(aid, manifest["name"], stats,
                                   run_limits_hook(manifest, adapter_dir, args.force),
                                   status_text=manifest.get("usageStatusText", ""),
                                   auth_help=manifest.get("authHelpText", ""),
                                   tier_label=manifest.get("tierLabel", ""))
+            # commit: cursors + counters move together, only on success
+            for key, value in run_state.items():
+                if key != "stats":
+                    state[key] = value
+            all_stats[aid] = stats
             save_state(state)  # persist cursors+counters before the record
             write_record(record, args.usage_dir)
-            print(f"{aid}: {len(events)} new events -> {aid}.json")
-        except Exception as e:  # isolation: one adapter never blocks others
+            print(f"{aid}: {merged} new events -> {aid}.json")
+        except Exception as e:  # isolation: nothing committed; one adapter never blocks others
             log(f"{aid}: FAILED {e}")
             status = 1
 

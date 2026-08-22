@@ -117,26 +117,44 @@ history size.
 
 - State holds per-file append cursors and per-adapter counters only; event
   lists are never stored or re-read.
+- Collectors yield events one at a time into the accumulator; per-run memory
+  is proportional to one event plus one line/row buffer, never to history
+  size. First runs and migrations parse the full history without
+  materializing it.
 - JSONL files are read append-only from the last byte offset; a truncated or
-  rotated file triggers a full rescan. A mid-file rewrite that grows the file
-  is not detected (JSONL session logs are append-only in practice).
-- SQLite reads stream row by row; with a `ts` column only rows newer than the
-  last seen timestamp are fetched (adapter queries SHOULD `ORDER BY` the
+  rotated file triggers a full rescan, and a head fingerprint forces a full
+  rescan when a file was replaced and regrown. A straddle line left by a
+  crash-interrupted append is re-attached and parsed once. A mid-file rewrite
+  that keeps the head and grows the file is not detected (JSONL session logs
+  are append-only in practice).
+- SQLite reads stream row by row; with a `ts` column only rows at or after the
+  last seen timestamp are fetched, and rows sharing that boundary timestamp
+  are deduplicated by fingerprint (adapter queries SHOULD `ORDER BY` the
   timestamp column).
-- Hook stdout is streamed and capped: 100,000 lines for `collect`, 1 MiB for
-  `limits`; hook stderr is capped at 1 MiB. A hook that exceeds a cap is
-  killed and its partial events are kept; other adapters are unaffected.
+- Hook stdout is streamed and capped: 100,000 lines and 1 MiB of buffering
+  for `collect`, 1 MiB for `limits`; hook stderr is capped at 1 MiB. A hook
+  that exceeds a cap is killed and its partial events are kept; other
+  adapters are unaffected. A hook that daemonizes cannot hang the engine
+  (bounded join).
+- Hooks are stateless: they may re-emit their full history. The engine
+  deduplicates hook events by fingerprint (50,000 per adapter); the same
+  event is never counted twice.
 - The service streams engine stderr line by line with a 1 MiB cap instead of
-  buffering it to process end.
+  buffering it to process end; the cap resets and the parser re-attaches on
+  every run.
 - Session ids: the newest 10,000 are kept per adapter; beyond that
   `totalSessions` is the stored count plus the evicted count (approximate).
 - Model buckets: 50 per adapter; further models roll into `other`.
 - Active dates: 730 days are kept; older ones still count toward `activeDays`.
 - A state file larger than 64 MiB is ignored and rebuilt by a one-time full
-  rescan. This also migrates pre-v2 state: totals are rebuilt from the session
-  files, so no history is lost unless the files are gone.
+  rescan. This also migrates older state layouts (v1/v2): totals are rebuilt
+  from the session files, so no history is lost unless the files are gone.
+- Adapter runs are staged: if an adapter fails mid-run, its counters and
+  cursors commit nothing, so repeated failures never change totals.
 - Crash window: state is saved before each adapter's record. A crash in
   between can double-count that adapter's appended bytes on the next run.
+  The sqlite `>=` boundary and hook fingerprints bound the same issue for
+  those sources.
 
 ## Notes
 

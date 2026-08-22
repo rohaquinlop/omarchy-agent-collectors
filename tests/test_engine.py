@@ -21,6 +21,19 @@ ac = module_from_spec(spec)
 loader.exec_module(ac)
 
 
+# Collectors are generators; tests consume them eagerly.
+def cj(*a, **k):
+    return list(ac.collect_jsonl_lines(*a, **k))
+
+
+def cs(*a, **k):
+    return list(ac.collect_sqlite_query(*a, **k))
+
+
+def ch(*a, **k):
+    return list(ac.collect_hook(*a, **k))
+
+
 def ev(ts, session="s1", model="m", kind="completion", inp=10, out=5, cr=2, cw=1):
     if kind == "prompt":
         inp = out = cr = cw = 0
@@ -177,18 +190,18 @@ class TestJsonlCollector(unittest.TestCase):
 
     def test_parse_and_incremental_cursor(self):
         self.write_session([{"type": "session"}, self.PI_LINE])
-        events = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        events = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["model"], "mimo-v2.5-pro")
         self.assertEqual(events[0]["input"], 100)
 
         # unchanged rerun: no new events, cursor kept
-        again = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        again = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(again, [])
 
         # append a second assistant message -> only the new event is returned
         self.append([dict(self.PI_LINE, id="m2")])
-        grown = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        grown = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(grown), 1)
         self.assertEqual(grown[0]["input"], 100)
 
@@ -198,40 +211,56 @@ class TestJsonlCollector(unittest.TestCase):
              "message": {"role": "user", "content": []}},
             self.PI_LINE,
         ])
-        events = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        events = cj(self.source(), self.tmp, self.state, force=False)
         kinds = sorted(e["kind"] for e in events)
         self.assertEqual(kinds, ["completion", "prompt"])
 
     def test_truncated_file_rescans(self):
         self.write_session([self.PI_LINE, dict(self.PI_LINE, id="m2")])
-        first = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        first = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(first), 2)
         # rotate: shorter file with different content
         self.write_session([dict(self.PI_LINE, id="m3")])
-        after = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        after = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(after), 1)
 
-    def test_unterminated_tail_continuation_skipped(self):
+    def test_unterminated_tail_reattached(self):
         # file ends without newline; the partial line is unparseable and skipped
         p = os.path.join(self.tmp, "sess1.jsonl")
         with open(p, "w") as fh:
             fh.write(json.dumps(self.PI_LINE) + "\n")
             fh.write('{"type": "message", "timestamp": "2026-08-2')  # partial line, no newline
-        first = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
+        first = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(first), 1)
-        # continuation arrives: first line of the new chunk is a continuation -> skipped
+        # continuation arrives: the stored tail is re-attached and parsed once
         with open(p, "a") as fh:
             fh.write('1T10:00:00Z", "message": {"role": "assistant", "model": "m", "usage": {}}}')
             fh.write("\n")
             fh.write(json.dumps(dict(self.PI_LINE, id="m2")) + "\n")
-        after = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
-        self.assertEqual(len(after), 1)
-        self.assertEqual(after[0]["input"], 100)
+        after = cj(self.source(), self.tmp, self.state, force=False)
+        self.assertEqual(len(after), 2)
+        self.assertEqual(after[0]["model"], "m")  # the re-attached straddle line
+        self.assertEqual(after[1]["input"], 100)   # the appended message
+        # nothing re-read on a third run
+        self.assertEqual(cj(self.source(), self.tmp, self.state, force=False), [])
+
+    def test_rotated_and_regrown_file_rescans(self):
+        self.write_session([self.PI_LINE, dict(self.PI_LINE, id="m2")])
+        first = cj(self.source(), self.tmp, self.state, force=False)
+        self.assertEqual(len(first), 2)
+        size_before = os.path.getsize(os.path.join(self.tmp, "sess1.jsonl"))
+        # replace with different content that grows past the old offset
+        lines = [dict(self.PI_LINE, id="m3"), dict(self.PI_LINE, id="m4"),
+                 dict(self.PI_LINE, id="m5", timestamp="2026-08-21T11:00:00Z")]
+        self.write_session(lines)
+        self.assertGreater(os.path.getsize(os.path.join(self.tmp, "sess1.jsonl")), size_before)
+        after = cj(self.source(), self.tmp, self.state, force=False)
+        self.assertEqual(len(after), 3)  # head mismatch forced a full rescan
 
     def test_force_rescans_and_returns_everything(self):
         self.write_session([self.PI_LINE])
-        ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=False)
-        again = ac.collect_jsonl_lines(self.source(), self.tmp, self.state, force=True)
+        cj(self.source(), self.tmp, self.state, force=False)
+        again = cj(self.source(), self.tmp, self.state, force=True)
         self.assertEqual(len(again), 1)
 
 
@@ -271,13 +300,13 @@ class TestSqliteCollector(unittest.TestCase):
 
     def test_events_from_db_and_incremental_last_ts(self):
         state = {}
-        events = ac.collect_sqlite_query(self.source(), self.tmp, state, force=False)
+        events = cs(self.source(), self.tmp, state, force=False)
         self.assertEqual(len(events), 2)
         kinds = sorted(e["kind"] for e in events)
         self.assertEqual(kinds, ["completion", "prompt"])
 
         # unchanged db: no new events
-        cached = ac.collect_sqlite_query(self.source(), self.tmp, state, force=False)
+        cached = cs(self.source(), self.tmp, state, force=False)
         self.assertEqual(cached, [])
 
         # append one row -> only the new row is returned
@@ -288,15 +317,39 @@ class TestSqliteCollector(unittest.TestCase):
                                                                        "cache": {"read": 3, "write": 4}}})))
         con.commit()
         con.close()
-        grown = ac.collect_sqlite_query(self.source(), self.tmp, state, force=False)
+        grown = cs(self.source(), self.tmp, state, force=False)
         self.assertEqual(len(grown), 1)
         self.assertEqual(grown[0]["session"], "s2")
 
     def test_readonly_connection_wal_tolerant(self):
         # mode=ro must not fail on an existing -wal sidecar
         open(self.db + "-wal", "a").close()
-        events = ac.collect_sqlite_query(self.source(), self.tmp, {}, force=True)
+        events = cs(self.source(), self.tmp, {}, force=True)
         self.assertEqual(len(events), 2)
+
+    def test_boundary_ties_merged_once(self):
+        state = {}
+        first = cs(self.source(), self.tmp, state, force=False)
+        self.assertEqual(len(first), 2)
+        # append a row with the SAME ts as the last seen row
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO message VALUES (?,?,?,?)",
+                    ("a3", "s3", 1755770401000, json.dumps({"role": "assistant", "modelID": "qwen",
+                                                              "tokens": {"input": 5, "output": 5,
+                                                                         "cache": {"read": 0, "write": 0}}})))
+        con.commit()
+        con.close()
+        grown = cs(self.source(), self.tmp, state, force=False)
+        self.assertEqual(len(grown), 1)
+        self.assertEqual(grown[0]["session"], "s3")
+        # boundary rows re-fetched but skipped
+        self.assertEqual(cs(self.source(), self.tmp, state, force=False), [])
+
+    def test_non_select_query_fails_cleanly(self):
+        src = self.source()
+        src["query"] = "DELETE FROM message"
+        with self.assertRaises(RuntimeError):
+            cs(src, self.tmp, {}, force=False)
 
 
 class TestHookBounding(unittest.TestCase):
@@ -309,7 +362,7 @@ class TestHookBounding(unittest.TestCase):
     def test_collect_hook_streams_events(self):
         with open(self.script, "w") as fh:
             fh.write('#!/bin/sh\necho \'{"ts": "2026-08-21T10:00:00Z", "session": "s1", "kind": "completion", "input": 1}\'\n')
-        events = ac.collect_hook({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
         self.assertEqual(len(events), 1)
 
     def test_collect_hook_output_capped(self):
@@ -317,7 +370,7 @@ class TestHookBounding(unittest.TestCase):
             fh.write("#!/bin/sh\n")
             for _ in range(ac.HOOK_EVENT_CAP + 50):
                 fh.write('echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n')
-        events = ac.collect_hook({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
         self.assertEqual(len(events), ac.HOOK_EVENT_CAP)
 
     def test_collect_hook_timeout_kills(self):
@@ -327,7 +380,7 @@ class TestHookBounding(unittest.TestCase):
         ac.HOOK_TIMEOUT_S = 2
         try:
             with self.assertRaises(RuntimeError):
-                ac.collect_hook({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+                ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
         finally:
             ac.HOOK_TIMEOUT_S = old
 
@@ -335,7 +388,7 @@ class TestHookBounding(unittest.TestCase):
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\necho oops >&2\nexit 3\n")
         with self.assertRaises(RuntimeError) as ctx:
-            ac.collect_hook({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+            ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
         self.assertIn("oops", str(ctx.exception))
 
     def test_limits_hook_capped_and_optional(self):
@@ -346,6 +399,132 @@ class TestHookBounding(unittest.TestCase):
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\nexit 1\n")
         self.assertEqual(ac.run_limits_hook({"id": "x", "limits": "collect.sh"}, self.tmp, force=False), [])
+
+    def test_single_giant_line_capped(self):
+        with open(self.script, "w") as fh:
+            fh.write("#!/bin/sh\n")
+            fh.write("head -c 2097152 /dev/zero | tr '\\0' 'a'\n")
+            fh.write("echo '{\"ts\": \"2026-08-21T10:00:00Z\", \"session\": \"s\", \"kind\": \"completion\"}'\n")
+        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+        self.assertEqual(events, [])
+
+    def test_daemonized_hook_does_not_hang(self):
+        # daemon holds the stderr pipe open after the hook exits
+        with open(self.script, "w") as fh:
+            fh.write("#!/bin/sh\n")
+            fh.write("setsid sh -c 'sleep 4' >/dev/null &\n")
+            fh.write("echo '{\"ts\": \"2026-08-21T10:00:00Z\", \"session\": \"s\", \"kind\": \"completion\"}'\n")
+        t0 = time.monotonic()
+        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+        self.assertEqual(len(events), 1)
+        self.assertLess(time.monotonic() - t0, 10)
+
+
+class TestHookDedupe(unittest.TestCase):
+    def test_duplicate_events_merged_once(self):
+        stats = ac.fresh_stats()
+        events = [ev("2026-08-21T10:00:00Z", "s1", "m"),
+                  ev("2026-08-21T10:00:01Z", "s2", "m")]
+        self.assertEqual(ac.merge_hook_events(stats, events), 2)
+        self.assertEqual(ac.merge_hook_events(stats, events), 0)  # re-emitted history
+        self.assertEqual(ac.merge_hook_events(stats, [ev("2026-08-21T10:00:02Z", "s3", "m")]), 1)
+        rec = ac.build_record("x", "X", stats, [])
+        self.assertEqual(rec["totalSessions"], 3)
+
+    def test_fingerprint_list_capped(self):
+        stats = ac.fresh_stats()
+        old = ac.HOOK_FP_CAP
+        ac.HOOK_FP_CAP = 10
+        try:
+            events = [ev(f"2026-08-21T10:00:0{i}Z", f"s{i}", "m") for i in range(15)]
+            self.assertEqual(ac.merge_hook_events(stats, events), 15)
+            self.assertEqual(len(stats["hookFp"]), 10)
+        finally:
+            ac.HOOK_FP_CAP = old
+
+
+class TestFailureIsolation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_state = ac.STATE_FILE
+        self.old_builtin = ac.BUILTIN_ADAPTERS_DIR
+        self.old_user = ac.USER_ADAPTERS_DIR
+        self.old_collectors = dict(ac.COLLECTORS)
+        ac.STATE_FILE = os.path.join(self.tmp, "state.json")
+        ac.BUILTIN_ADAPTERS_DIR = os.path.join(self.tmp, "none")
+        ac.USER_ADAPTERS_DIR = os.path.join(self.tmp, "none2")
+        self.ad = os.path.join(self.tmp, "adapters", "bad")
+        os.makedirs(self.ad)
+        with open(os.path.join(self.ad, "manifest.json"), "w") as fh:
+            json.dump({"schemaVersion": 1, "id": "bad", "name": "Bad",
+                       "sources": [{"format": "jsonl-lines",
+                                     "glob": os.path.join(self.tmp, "*.jsonl"),
+                                     "kindPath": "type", "kinds": ["message"],
+                                     "rolePath": "message.role",
+                                     "promptRole": "user", "completionRole": "assistant",
+                                     "timestampPath": "timestamp", "modelPath": "message.model",
+                                     "tokens": {"input": "message.usage.input",
+                                                 "output": "message.usage.output",
+                                                 "cacheRead": "message.usage.cacheRead",
+                                                 "cacheWrite": "message.usage.cacheWrite"}}]}, fh)
+        self.usage = os.path.join(self.tmp, "usage")
+        os.makedirs(self.usage)
+        self.args = ["--adapters-dir", os.path.join(self.tmp, "adapters"),
+                     "--usage-dir", self.usage]
+
+    def tearDown(self):
+        ac.STATE_FILE = self.old_state
+        ac.BUILTIN_ADAPTERS_DIR = self.old_builtin
+        ac.USER_ADAPTERS_DIR = self.old_user
+        ac.COLLECTORS.clear()
+        ac.COLLECTORS.update(self.old_collectors)
+
+    def test_failed_run_commits_nothing(self):
+        def boom(source, adapter_dir, state, force):
+            yield ev("2026-08-21T10:00:00Z")
+            raise RuntimeError("mid-stream failure")
+
+        ac.COLLECTORS["jsonl-lines"] = boom
+        self.assertEqual(ac.main(self.args), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.usage, "bad.json")))
+        with open(ac.STATE_FILE) as fh:
+            self.assertNotIn("bad", json.load(fh).get("stats", {}))
+        # repeated failures never change totals
+        self.assertEqual(ac.main(self.args), 1)
+        with open(ac.STATE_FILE) as fh:
+            self.assertNotIn("bad", json.load(fh).get("stats", {}))
+
+    def test_successful_run_commits(self):
+        def ok(source, adapter_dir, state, force):
+            yield ev("2026-08-21T10:00:00Z")
+
+        ac.COLLECTORS["jsonl-lines"] = ok
+        self.assertEqual(ac.main(self.args), 0)
+        with open(ac.STATE_FILE) as fh:
+            state = json.load(fh)
+        self.assertEqual(state["stats"]["bad"]["promptsTotal"], 0)
+        self.assertEqual(state["stats"]["bad"]["sessions"], ["s1"])
+        self.assertTrue(os.path.exists(os.path.join(self.usage, "bad.json")))
+
+    def test_repeat_runs_merge_only_new_events(self):
+        """Regression: committed cursors must be visible to the next run."""
+        ac.COLLECTORS.update(self.old_collectors)
+        with open(os.path.join(self.tmp, "sess.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "message", "timestamp": "2026-08-21T10:00:00Z",
+                                 "message": {"role": "assistant", "model": "m",
+                                              "usage": {"input": 1, "output": 2,
+                                                         "cacheRead": 3, "cacheWrite": 4}}}) + "\n")
+        self.assertEqual(ac.main(self.args), 0)
+        with open(ac.STATE_FILE) as fh:
+            state = json.load(fh)
+        sessions_before = state["stats"]["bad"]["sessions"]
+        self.assertEqual(len(sessions_before), 1)
+        # second run: cursor committed, nothing new to merge
+        self.assertEqual(ac.main(self.args), 0)
+        with open(ac.STATE_FILE) as fh:
+            state = json.load(fh)
+        self.assertEqual(state["stats"]["bad"]["sessions"], sessions_before)
+        self.assertEqual(state["stats"]["bad"]["modelUsage"]["m"]["inputTokens"], 1)
 
 
 class TestStateLifecycle(unittest.TestCase):
@@ -360,6 +539,11 @@ class TestStateLifecycle(unittest.TestCase):
     def test_v1_state_ignored_and_rebuilt(self):
         with open(ac.STATE_FILE, "w") as fh:
             json.dump({"jsonl:old": {"f": {"sig": 1, "events": [1, 2, 3]}}}, fh)
+        self.assertEqual(ac.load_state(), {})
+
+    def test_v2_state_ignored_and_rebuilt(self):
+        with open(ac.STATE_FILE, "w") as fh:
+            json.dump({"schemaVersion": 2, "stats": {"pi": {"promptsTotal": 9}}}, fh)
         self.assertEqual(ac.load_state(), {})
 
     def test_v2_state_roundtrip(self):
@@ -387,10 +571,67 @@ class TestStateLifecycle(unittest.TestCase):
         src = {"format": "sqlite-query", "database": db, "promptRole": "user",
                "completionRole": "assistant",
                "query": "SELECT ts, role FROM m", "columns": {"ts": "ts", "role": "role"}}
-        ac.collect_sqlite_query(src, "", state, force=False)
+        cs(src, "", state, force=False)
         self.assertNotIn("events", json.dumps(state))
         self.assertEqual(set(state),
                          {"schemaVersion"} | {k for k in state if k.startswith("sqlite:")})
+
+
+class TestStreaming(unittest.TestCase):
+    def source(self, tmp):
+        return {
+            "format": "jsonl-lines",
+            "glob": os.path.join(tmp, "**/*.jsonl"),
+            "kindPath": "type", "kinds": ["message"],
+            "rolePath": "message.role", "promptRole": "user", "completionRole": "assistant",
+            "timestampPath": "timestamp", "modelPath": "message.model",
+            "tokens": {"input": "message.usage.input", "output": "message.usage.output",
+                       "cacheRead": "message.usage.cacheRead", "cacheWrite": "message.usage.cacheWrite"},
+        }
+
+    def test_large_history_streams_without_materializing(self):
+        import types
+        tmp = tempfile.mkdtemp()
+        n = 20000
+        line = json.dumps({"type": "message", "timestamp": "2026-08-21T10:00:00Z",
+                           "message": {"role": "assistant", "model": "m",
+                                        "usage": {"input": 1, "output": 2,
+                                                   "cacheRead": 3, "cacheWrite": 4}}})
+        with open(os.path.join(tmp, "big.jsonl"), "w") as fh:
+            for _ in range(n):
+                fh.write(line + "\n")
+        state = {}
+        gen = ac.collect_jsonl_lines(self.source(tmp), tmp, state, force=False)
+        self.assertIsInstance(gen, types.GeneratorType)
+        stats = ac.fresh_stats()
+        merged = ac.merge_events(stats, gen)
+        self.assertEqual(merged, n)
+        rec = ac.build_record("x", "X", stats, [])
+        self.assertEqual(rec["totalSessions"], 1)
+        self.assertEqual(rec["totalPrompts"], 0)
+        # cursor advanced: rerun yields nothing
+        self.assertEqual(cj(self.source(tmp), tmp, state, force=False), [])
+        # state holds cursors only, never events
+        self.assertNotIn("events", json.dumps(state))
+
+    def test_sqlite_streams_row_by_row(self):
+        import types
+        tmp = tempfile.mkdtemp()
+        db = os.path.join(tmp, "t.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE m (ts integer, role text)")
+        con.executemany("INSERT INTO m VALUES (?,?)", [(i, "user") for i in range(100)])
+        con.commit()
+        con.close()
+        src = {"format": "sqlite-query", "database": db, "promptRole": "user",
+               "completionRole": "assistant", "query": "SELECT ts, role FROM m",
+               "columns": {"ts": "ts", "role": "role"}}
+        state = {}
+        gen = ac.collect_sqlite_query(src, tmp, state, force=False)
+        self.assertIsInstance(gen, types.GeneratorType)
+        merged = ac.merge_events(ac.fresh_stats(), gen)
+        self.assertEqual(merged, 100)
+        self.assertEqual(cs(src, tmp, state, force=False), [])
 
 
 class TestManifestValidation(unittest.TestCase):
