@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import types
 import unittest
 from datetime import datetime, timezone
 from typing import ClassVar
@@ -495,7 +496,7 @@ class TestHookBounding(unittest.TestCase):
                 '#!/bin/sh\necho \'{"ts": "2026-08-21T10:00:00Z", "session": "s1", "kind": "completion", "input": 1}\'\n'
             )
         events = ch(
-            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+            {"id": "x", "collect": "collect.sh"}, self.tmp, force=False
         )
         self.assertEqual(len(events), 1)
 
@@ -507,7 +508,7 @@ class TestHookBounding(unittest.TestCase):
                 for _ in range(ac.HOOK_EVENT_CAP + 50)
             )
         events = ch(
-            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+            {"id": "x", "collect": "collect.sh"}, self.tmp, force=False
         )
         self.assertEqual(len(events), ac.HOOK_EVENT_CAP)
 
@@ -521,7 +522,6 @@ class TestHookBounding(unittest.TestCase):
                 ch(
                     {"id": "x", "collect": "collect.sh"},
                     self.tmp,
-                    {},
                     force=False,
                 )
         finally:
@@ -531,7 +531,11 @@ class TestHookBounding(unittest.TestCase):
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\necho oops >&2\nexit 3\n")
         with self.assertRaises(RuntimeError) as ctx:
-            ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+            ch(
+                {"id": "x", "collect": "collect.sh"},
+                self.tmp,
+                force=False,
+            )
         self.assertIn("oops", str(ctx.exception))
 
     def test_limits_hook_capped_and_optional(self):
@@ -558,9 +562,37 @@ class TestHookBounding(unittest.TestCase):
                 'echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n'
             )
         events = ch(
-            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+            {"id": "x", "collect": "collect.sh"}, self.tmp, force=False
         )
         self.assertEqual(events, [])
+
+    def test_collect_hook_cumulative_bytes_capped(self):
+        line = json.dumps(
+            {
+                "ts": "2026-08-21T10:00:00Z",
+                "session": "s",
+                "kind": "completion",
+                "pad": "x" * 60,
+            },
+            separators=(",", ":"),
+        )
+        keep = 1000 // len(line) + 1  # crossing line is kept, then killed
+        old = ac.HOOK_OUTPUT_BYTES_CAP
+        ac.HOOK_OUTPUT_BYTES_CAP = 1000
+        try:
+            with open(self.script, "w") as fh:
+                fh.write("#!/bin/sh\n")
+                fh.writelines(f"echo '{line}'\n" for _ in range(50))
+            events = ch(
+                {"id": "x", "collect": "collect.sh"},
+                self.tmp,
+                force=False,
+            )
+        finally:
+            ac.HOOK_OUTPUT_BYTES_CAP = old
+        self.assertGreater(keep, 0)
+        self.assertLess(keep, 50)
+        self.assertEqual(len(events), keep)
 
     def test_daemonized_hook_does_not_hang(self):
         # daemon holds the stderr pipe open after the hook exits
@@ -572,7 +604,7 @@ class TestHookBounding(unittest.TestCase):
             )
         t0 = time.monotonic()
         events = ch(
-            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+            {"id": "x", "collect": "collect.sh"}, self.tmp, force=False
         )
         self.assertEqual(len(events), 1)
         self.assertLess(time.monotonic() - t0, 10)
@@ -754,7 +786,7 @@ class TestStateLifecycle(unittest.TestCase):
             )
         self.assertEqual(ac.load_state(), {})
 
-    def test_v2_state_roundtrip(self):
+    def test_state_roundtrip(self):
         state = {"schemaVersion": 2, "stats": {"pi": {"promptsTotal": 7}}}
         ac.save_state(state)
         loaded = ac.load_state()
@@ -813,8 +845,6 @@ class TestStreaming(unittest.TestCase):
         }
 
     def test_large_history_streams_without_materializing(self):
-        import types
-
         tmp = tempfile.mkdtemp()
         n = 20000
         line = json.dumps(
@@ -850,8 +880,6 @@ class TestStreaming(unittest.TestCase):
         self.assertNotIn("events", json.dumps(state))
 
     def test_sqlite_streams_row_by_row(self):
-        import types
-
         tmp = tempfile.mkdtemp()
         db = os.path.join(tmp, "t.db")
         con = sqlite3.connect(db)
@@ -909,6 +937,18 @@ class TestFilters(unittest.TestCase):
             ac.detect_ok({"detect": [{"path": "/nonexistent/path/xyz"}]})
         )
         self.assertTrue(ac.detect_ok({}))
+
+    def test_detect_command_times_out(self):
+        old = ac.DETECT_TIMEOUT_S
+        ac.DETECT_TIMEOUT_S = 1
+        try:
+            t0 = time.monotonic()
+            self.assertFalse(
+                ac.detect_ok({"detect": [{"type": "command", "command": "sleep 5"}]})
+            )
+            self.assertLess(time.monotonic() - t0, 4)
+        finally:
+            ac.DETECT_TIMEOUT_S = old
 
     def test_superseded_uses_omarchy_bin(self):
         old = ac.OMARCHY_BIN

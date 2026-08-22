@@ -118,9 +118,9 @@ history size.
 - State holds per-file append cursors and per-adapter counters only; event
   lists are never stored or re-read.
 - Collectors yield events one at a time into the accumulator; per-run memory
-  is proportional to one event plus one line/row buffer, never to history
-  size. First runs and migrations parse the full history without
-  materializing it.
+  is proportional to one event plus one line/row buffer (collect hooks add
+  their capped output budget), never to history size. First runs and
+  migrations parse the full history without materializing it.
 - JSONL files are read append-only from the last byte offset; a truncated or
   rotated file triggers a full rescan, and a head fingerprint forces a full
   rescan when a file was replaced and regrown. A straddle line left by a
@@ -131,8 +131,9 @@ history size.
   last seen timestamp are fetched, and rows sharing that boundary timestamp
   are deduplicated by fingerprint (adapter queries SHOULD `ORDER BY` the
   timestamp column).
-- Hook stdout is streamed and capped: 100,000 lines and 1 MiB of buffering
-  for `collect`, 1 MiB for `limits`; hook stderr is capped at 1 MiB. A hook
+- Hook stdout is streamed and capped: 100,000 lines with 1 MiB of line
+  buffering and a 16 MiB cumulative byte budget for `collect`, 1 MiB for
+  `limits`; hook stderr is capped at 1 MiB. A hook
   that exceeds a cap is killed and its partial events are kept; other
   adapters are unaffected. A hook that daemonizes cannot hang the engine
   (bounded join).

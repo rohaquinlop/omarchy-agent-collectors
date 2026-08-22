@@ -13,7 +13,7 @@ materialized in memory, regardless of history size.
 
 Usage:
   agent-collectors [--force] [--except <id>] ... [<id> ...]
-  agent-collectors --validate [adapter-dir]
+  agent-collectors --validate [--adapters-dir <dir>]
 
 Exit codes: 0 ok, 1 at least one adapter failed.
 """
@@ -25,6 +25,7 @@ import base64
 import bisect
 import copy
 import glob as globmod
+import hashlib
 import json
 import os
 import selectors
@@ -76,8 +77,13 @@ HOOK_EVENT_CAP: int = 100_000  # max stdout lines read from a collect hook
 HOOK_STDOUT_CAP: int = (
     1024 * 1024
 )  # max stdout bytes read from a hook (lines or doc)
+HOOK_OUTPUT_BYTES_CAP: int = (
+    16 * 1024 * 1024
+)  # max cumulative bytes of collect-hook lines kept
 HOOK_STDERR_CAP: int = 1024 * 1024  # max stderr bytes spooled from a hook
 HOOK_FP_CAP: int = 50_000  # max hook event fingerprints kept per adapter
+BOUNDARY_FP_CAP: int = 10_000  # max boundary-timestamp fingerprints per sqlite source
+DETECT_TIMEOUT_S: int = 15  # detect command timeout
 PARTIAL_CAP = 8192  # max straddle-line tail bytes kept per jsonl file
 HEAD_LEN = 64  # first bytes fingerprinted to detect file replacement
 
@@ -198,8 +204,6 @@ def file_head(path: str, size: int) -> str:
 
 def event_fp(ev: dict) -> str:
     """Fingerprint of a canonical event; used for hook dedupe."""
-    import hashlib
-
     raw = json.dumps(
         [
             ev["ts"],
@@ -361,8 +365,6 @@ def db_sig(db_path: str):
 
 
 def hashlib_key(text: str) -> str:
-    import hashlib
-
     return hashlib.sha1(text.encode()).hexdigest()[:12]
 
 
@@ -465,7 +467,7 @@ def collect_sqlite_query(
                     and raw == max_raw
                 ):
                     new_boundary.append(event_fp(ev))
-                    if len(new_boundary) > 10_000:
+                    if len(new_boundary) > BOUNDARY_FP_CAP:
                         new_boundary.pop(0)
                 yield ev
         finally:
@@ -504,8 +506,9 @@ def _hook_run(
 ):
     """Run a hook with bounded output capture.
 
-    stdout is read with a deadline and capped (by lines for collect hooks, by
-    bytes for limits hooks); the process is killed on cap or timeout. stderr is
+    stdout is read with a deadline and capped (by lines plus a cumulative
+    byte budget for collect hooks, by bytes for limits hooks); the process is
+    killed on cap or timeout. stderr is
     spooled to a memory-bounded temp file (rolls to disk past the cap).
     Returns (status, output, stderr_tail, stderr_capped, returncode) where
     status is "ok", "capped", or "timeout" and output is a list of lines or a
@@ -543,6 +546,7 @@ def _hook_run(
         sel.register(stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
         buf = b""
+        total = 0  # cumulative bytes appended to lines (collect hook budget)
         lines: list[str] = []
         raw_out = bytearray()
         status = "ok"
@@ -566,27 +570,30 @@ def _hook_run(
                         break
                     raw_out.extend(chunk)
                 else:
-                    buf += chunk
-                    if len(buf) > HOOK_STDOUT_CAP:
+                    if len(buf) + len(chunk) > HOOK_STDOUT_CAP:
                         _kill_group(proc)
                         status = "capped"
                         break
+                    buf += chunk
                     while b"\n" in buf:
                         raw, buf = buf.split(b"\n", 1)
                         line = raw.decode("utf-8", "replace").strip()
                         if line:
                             lines.append(line)
+                            total += len(line)
                             if (
                                 max_lines is not None
                                 and len(lines) >= max_lines
-                            ):
+                            ) or total > HOOK_OUTPUT_BYTES_CAP:
                                 _kill_group(proc)
                                 status = "capped"
                                 break
                     if status == "capped":
                         break
             if max_bytes is None and buf.strip():
-                lines.append(buf.decode("utf-8", "replace").strip())
+                tail = buf.decode("utf-8", "replace").strip()
+                if total + len(tail) <= HOOK_OUTPUT_BYTES_CAP:
+                    lines.append(tail)
         finally:
             try:
                 proc.wait(timeout=max(0.0, deadline - time.monotonic()))
@@ -609,7 +616,7 @@ def _hook_run(
         return status, output, stderr_tail, stderr_capped["v"], proc.returncode
 
 
-def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool):
+def collect_hook(adapter: dict, adapter_dir: str, force: bool):
     """Yield events parsed from a collect hook's stdout, one at a time."""
     script = adapter.get("collect")
     if not script:
@@ -631,7 +638,8 @@ def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool):
         )
     if status == "capped":
         log(
-            f"{adapter['id']} collect hook: stdout capped at {HOOK_EVENT_CAP} lines"
+            f"{adapter['id']} collect hook: stdout capped at {HOOK_EVENT_CAP}"
+            f" lines or {HOOK_OUTPUT_BYTES_CAP} bytes"
         )
     elif returncode != 0:
         raise RuntimeError(f"collect hook failed: {stderr_tail.strip()[:300]}")
@@ -689,7 +697,8 @@ def merge_hook_events(stats: dict, events, now: datetime | None = None) -> int:
 
     Hooks are stateless and may re-emit their full history; the per-adapter
     fingerprint list (capped) makes each distinct event count once. The
-    intermediate list is bounded by the hook output cap.
+    intermediate list is bounded by the hook output caps (lines and
+    cumulative bytes).
     """
     fps = set(stats["hookFp"])
     fresh = []
@@ -747,10 +756,8 @@ def merge_events(stats: dict, events, now: datetime | None = None) -> int:
         d = day_key(ev["ts"])
         sid = ev["session"]
         tokens = ev["input"] + ev["output"] + ev["cacheRead"] + ev["cacheWrite"]
-        if sid:
-            if sid in sessions_seen:
-                pass
-            elif len(sessions) < SESSION_SET_CAP:
+        if sid and sid not in sessions_seen:
+            if len(sessions) < SESSION_SET_CAP:
                 sessions.append(sid)
                 sessions_seen.add(sid)
             else:
@@ -936,12 +943,17 @@ def detect_ok(manifest: dict) -> bool:
     for check in checks:
         path = expand(check.get("path", ""))
         if check.get("type") == "command":
-            if (
-                subprocess.run(
-                    check["command"], shell=True, check=False
-                ).returncode
-                != 0
-            ):
+            try:
+                r = subprocess.run(
+                    check["command"],
+                    shell=True,
+                    check=False,
+                    timeout=DETECT_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                log(f"detect command timed out: {check['command']}")
+                return False
+            if r.returncode != 0:
                 return False
         elif not os.path.exists(path):
             return False
@@ -1129,10 +1141,7 @@ def main(argv=None) -> int:
                 merged += merge_hook_events(
                     stats,
                     collect_hook(
-                        {**manifest, "collect": hook},
-                        adapter_dir,
-                        run_state,
-                        args.force,
+                        {**manifest, "collect": hook}, adapter_dir, args.force
                     ),
                 )
             record = build_record(
