@@ -6,6 +6,10 @@ data; the engine normalizes it into canonical events, aggregates them, and
 writes one stock-contract JSON record per agent into
 ~/.local/state/omarchy/agents/usage/ where the omarchy.agents panel watches.
 
+Memory model: bounded. State never stores event lists — only per-file append
+cursors, per-source last-timestamp cursors, and per-adapter counter blocks.
+Each run holds at most the events produced since the previous run.
+
 Usage:
   agent-collectors [--force] [--except <id>] ... [<id> ...]
   agent-collectors --validate [adapter-dir]
@@ -16,14 +20,19 @@ Exit codes: 0 ok, 1 at least one adapter failed.
 from __future__ import annotations
 
 import argparse
+import bisect
 import glob as globmod
 import json
 import os
+import selectors
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+import threading
+import time
+from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------- paths
 
@@ -37,7 +46,22 @@ SHELL_JSON = os.path.join(HOME, ".config", "omarchy", "shell.json")
 OMARCHY_BIN = os.path.join(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"), "bin")
 BUILTIN_ADAPTERS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "adapters"))
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 1  # record contract version (what the panel consumes)
+STATE_SCHEMA_VERSION = 2  # engine state version
+
+# ---------------------------------------------------------------- caps
+
+# Persistent state and per-run memory stay bounded by these, never by history.
+SESSION_SET_CAP = 10_000       # unique session ids kept per adapter
+MODEL_CAP = 50                 # model buckets kept per adapter (+ "other")
+ACTIVE_DATES_CAP = 730         # distinct active days kept per adapter
+DAY_WINDOW = 8                 # per-day token counters kept (today + 7)
+STATE_LOAD_GUARD = 64 * 1024 * 1024  # state files larger than this are ignored
+HOOK_TIMEOUT_S = 120           # collect hook timeout
+LIMITS_TIMEOUT_S = 30          # limits hook timeout
+HOOK_EVENT_CAP = 100_000       # max stdout lines read from a collect hook
+HOOK_STDOUT_CAP = 1024 * 1024  # max stdout bytes read from a limits hook
+HOOK_STDERR_CAP = 1024 * 1024  # max stderr bytes spooled from a hook
 
 
 def log(msg: str) -> None:
@@ -98,8 +122,6 @@ def day_key(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds).strftime("%Y-%m-%d")
 
 
-# ---------------------------------------------------------------- events
-
 def make_event(ts, session, model, kind, inp=0, out=0, cread=0, cwrite=0, unit="s") -> dict | None:
     ts = parse_ts(ts, unit)
     if ts is None:
@@ -116,26 +138,69 @@ def make_event(ts, session, model, kind, inp=0, out=0, cread=0, cwrite=0, unit="
     }
 
 
+def file_ends_newline(path: str, size: int) -> bool:
+    """True when the file's last byte is a newline (no partial final line)."""
+    if size <= 0:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(size - 1)
+            return fh.read(1) == b"\n"
+    except OSError:
+        return False
+
+
 # ------------------------------------------------- jsonl-lines collector
 
-def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
-    kind_path = source.get("kindPath", "")
-    kinds = set(source.get("kinds") or [])
-    role_path = source.get("rolePath", "")
-    prompt_role = source.get("promptRole", "user")
-    completion_role = source.get("completionRole", "assistant")
-    ts_path = source.get("timestampPath", "timestamp")
-    ts_unit = source.get("timestampUnit", "iso")
-    model_path = source.get("modelPath", "")
-    session_path = source.get("sessionIdPath", "")
-    tokens_map = source.get("tokens") or {}
+def jsonl_line_to_event(obj: dict, cfg: dict, path: str) -> dict | None:
+    """One parsed jsonl line -> canonical event, or None when filtered."""
+    if cfg["kinds"] and get_path(obj, cfg["kindPath"]) not in cfg["kinds"]:
+        return None
+    role = get_path(obj, cfg["rolePath"])
+    sid = get_path(obj, cfg["sessionPath"]) if cfg["sessionPath"] else None
+    if not sid:
+        sid = os.path.splitext(path)[0]
+    if role == cfg["promptRole"]:
+        return make_event(get_path(obj, cfg["tsPath"]), sid, None, "prompt")
+    if role == cfg["completionRole"]:
+        t = cfg["tokens"]
+        return make_event(
+            get_path(obj, cfg["tsPath"]),
+            sid,
+            get_path(obj, cfg["modelPath"]), "completion",
+            get_path(obj, t.get("input", "")) if t.get("input") else 0,
+            get_path(obj, t.get("output", "")) if t.get("output") else 0,
+            get_path(obj, t.get("cacheRead", "")) if t.get("cacheRead") else 0,
+            get_path(obj, t.get("cacheWrite", "")) if t.get("cacheWrite") else 0,
+        )
+    return None
 
+
+def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
+    """Return events new since the last run. Cache holds cursors only.
+
+    Cache entry per file: {"sig": {size, mtime_ns}, "offset": bytes, "newline": bool}.
+    Unchanged file -> skipped. Grown file -> only the appended bytes are parsed
+    (append-only assumption; a mid-file rewrite that grows the file is not
+    detected). Shrunk/rotated file -> full rescan from offset 0.
+    """
     files = sorted(set(globmod.glob(expand(source["glob"]), recursive=True)))
     cache_key = f"jsonl:{source['glob']}"
     cache = state.get(cache_key) if isinstance(state.get(cache_key), dict) else {}
     new_cache = {}
-
     events = []
+    cfg = {
+        "kinds": set(source.get("kinds") or []),
+        "kindPath": source.get("kindPath", ""),
+        "rolePath": source.get("rolePath", ""),
+        "promptRole": source.get("promptRole", "user"),
+        "completionRole": source.get("completionRole", "assistant"),
+        "tsPath": source.get("timestampPath", "timestamp"),
+        "tsUnit": source.get("timestampUnit", "iso"),
+        "modelPath": source.get("modelPath", ""),
+        "sessionPath": source.get("sessionIdPath", ""),
+        "tokens": source.get("tokens") or {},
+    }
     for path in files:
         try:
             st = os.stat(path)
@@ -145,13 +210,23 @@ def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool
         cached = cache.get(path)
         if not force and isinstance(cached, dict) and cached.get("sig") == sig:
             new_cache[path] = cached
-            events.extend(cached.get("events") or [])
             continue
-
         file_events = []
+        append_only = (not force and isinstance(cached, dict)
+                       and st.st_size >= cached.get("offset", 0))
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                skip_first = False
+                if append_only:
+                    fh.seek(cached.get("offset", 0))
+                    # first line of the new chunk continues an unterminated last line
+                    skip_first = cached.get("offset", 0) > 0 and not cached.get("newline", True)
+                first = True
                 for line in fh:
+                    if first:
+                        first = False
+                        if skip_first:  # continuation of an unterminated last line
+                            continue
                     line = line.strip()
                     if not line:
                         continue
@@ -159,38 +234,16 @@ def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if kinds and get_path(obj, kind_path) not in kinds:
-                        continue
-                    role = get_path(obj, role_path)
-                    sid = get_path(obj, session_path) if session_path else None
-                    if not sid:
-                        sid = os.path.splitext(path)[0]
-                    if role == prompt_role:
-                        ev = make_event(get_path(obj, ts_path), sid, None, "prompt")
-                    elif role == completion_role:
-                        t = tokens_map
-                        ev = make_event(
-                            get_path(obj, ts_path),
-                            sid,
-                            get_path(obj, model_path), "completion",
-                            get_path(obj, t.get("input", "")) if t.get("input") else 0,
-                            get_path(obj, t.get("output", "")) if t.get("output") else 0,
-                            get_path(obj, t.get("cacheRead", "")) if t.get("cacheRead") else 0,
-                            get_path(obj, t.get("cacheWrite", "")) if t.get("cacheWrite") else 0,
-                        )
-                    else:
-                        continue
+                    ev = jsonl_line_to_event(obj, cfg, path)
                     if ev:
                         file_events.append(ev)
         except OSError as e:
             log(f"{path}: {e}")
-            # keep any previously cached summary for this file
             if isinstance(cached, dict):
-                new_cache[path] = cached
-                events.extend(cached.get("events") or [])
+                new_cache[path] = cached  # retry next run
             continue
-        entry = {"sig": sig, "events": file_events}
-        new_cache[path] = entry
+        new_cache[path] = {"sig": sig, "offset": st.st_size,
+                           "newline": file_ends_newline(path, st.st_size)}
         events.extend(file_events)
 
     state[cache_key] = new_cache
@@ -199,26 +252,65 @@ def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool
 
 # ---------------------------------------------- sqlite-query collector
 
+def db_sig(db_path: str):
+    try:
+        st = os.stat(db_path)
+    except OSError:
+        return None
+    sig = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    wal = db_path + "-wal"
+    if os.path.exists(wal):
+        ws = os.stat(wal)
+        sig["wal"] = [ws.st_size, ws.st_mtime_ns]
+    return sig
+
+
+def hashlib_key(text: str) -> str:
+    import hashlib
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
+
+
 def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
+    """Return rows new since the last run, streamed row by row.
+
+    Cache entry: {"sig", "lastTs"} — never event lists. With a ts column the
+    user query is wrapped as SELECT * FROM (<query>) WHERE "<ts>" > ? so only
+    new rows are fetched. Requires ascending ts order in the query (adapter
+    queries SHOULD ORDER BY the timestamp column). Without a ts column a full
+    streaming rescan runs on every signature change.
+    """
     db_path = expand(source["database"])
     query = source["query"]
     cols = source.get("columns") or {}
     unit = source.get("timestampUnit", "s")
 
     cache_key = f"sqlite:{source['database']}:{hashlib_key(query)}"
-    cached_summary = state.get(cache_key) if isinstance(state.get(cache_key), dict) else {}
-    if not force and cached_summary.get("sig") == db_sig(db_path):
-        return decode_cached_events(cached_summary)
+    cached = state.get(cache_key) if isinstance(state.get(cache_key), dict) else {}
+    sig = db_sig(db_path)
+    if not force and cached.get("sig") == sig:
+        return []
 
-    uri = f"file:{db_path}?mode=ro"
+    ts_col = cols.get("ts", "")
+    last_ts = cached.get("lastTs") if (not force and isinstance(cached, dict)) else None
+    run_query, params = query, ()
+    if ts_col and last_ts is not None:
+        run_query = f'SELECT * FROM ({query}) WHERE "{ts_col}" > ?'
+        params = (last_ts,)
+
     events = []
+    max_raw = last_ts
+    uri = f"file:{db_path}?mode=ro"
     try:
         con = sqlite3.connect(uri, uri=True)
         try:
-            cur = con.execute(query)
+            cur = con.execute(run_query, params)
             names = [d[0] for d in cur.description]
-            for row in cur.fetchall():
+            for row in cur:  # streamed; rows are never materialized
                 row = dict(zip(names, row))
+                if ts_col:
+                    raw = row.get(ts_col)
+                    if raw is not None and (max_raw is None or raw > max_raw):
+                        max_raw = raw
                 role = row.get(cols.get("role", ""))
                 kind = "prompt" if role == source.get("promptRole", "user") else (
                     "completion" if role == source.get("completionRole", "assistant") else None)
@@ -241,57 +333,130 @@ def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: boo
     except sqlite3.Error as e:
         raise RuntimeError(f"sqlite {db_path}: {e}")
 
-    state[cache_key] = encode_cached_events(events, db_sig(db_path))
+    state[cache_key] = {"sig": sig, "lastTs": max_raw}
     return events
 
 
-def db_sig(db_path: str):
-    try:
-        st = os.stat(db_path)
-    except OSError:
-        return None
-    sig = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
-    wal = db_path + "-wal"
-    if os.path.exists(wal):
-        ws = os.stat(wal)
-        sig["wal"] = [ws.st_size, ws.st_mtime_ns]
-    return sig
-
-
-def hashlib_key(text: str) -> str:
-    import hashlib
-    return hashlib.sha1(text.encode()).hexdigest()[:12]
-
-
-# Caching full event lists in state would bloat; instead sqlite sources simply
-# rescan on signature change (cheap indexed queries) and skip on match by
-# reusing a stored compact digest of events.
-def encode_cached_events(events: list[dict], sig) -> dict:
-    return {"sig": sig, "events": events}
-
-
-def decode_cached_events(summary: dict) -> list[dict]:
-    return summary.get("events") or []
-
-
 # ------------------------------------------------------- hook collector
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the hook and any process it spawned (runaway-guard)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _hook_run(script: str, adapter_dir: str, timeout: float, env_extra: dict | None,
+              max_lines: int | None = None, max_bytes: int | None = None):
+    """Run a hook with bounded output capture.
+
+    stdout is read with a deadline and capped (by lines for collect hooks, by
+    bytes for limits hooks); the process is killed on cap or timeout. stderr is
+    spooled to a memory-bounded temp file (rolls to disk past the cap).
+    Returns (status, output, stderr_tail, stderr_capped, returncode) where
+    status is "ok", "capped", or "timeout" and output is a list of lines or a
+    byte string depending on the cap mode.
+    """
+    proc = subprocess.Popen(
+        [os.path.join(adapter_dir, script)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=adapter_dir,
+        env={**os.environ, **(env_extra or {})},
+        start_new_session=True,  # own process group: runaway children can be killed
+    )
+    spool = tempfile.SpooledTemporaryFile(max_size=HOOK_STDERR_CAP, mode="wb")
+    stderr_capped = {"v": False}
+
+    def pump_stderr():
+        while True:
+            chunk = proc.stderr.read(65536)
+            if not chunk:
+                return
+            if spool.tell() + len(chunk) > HOOK_STDERR_CAP:
+                stderr_capped["v"] = True
+                return
+            spool.write(chunk)
+
+    stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
+    stderr_thread.start()
+
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    buf = b""
+    lines: list[str] = []
+    raw_out = bytearray()
+    status = "ok"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_group(proc)
+            status = "timeout"
+            break
+        if not sel.select(min(remaining, 1.0)):
+            continue
+        chunk = os.read(proc.stdout.fileno(), 65536)
+        if not chunk:
+            break
+        if max_bytes is not None:
+            if len(raw_out) + len(chunk) > max_bytes:
+                raw_out.extend(chunk[: max_bytes - len(raw_out)])
+                _kill_group(proc)
+                status = "capped"
+                break
+            raw_out.extend(chunk)
+        else:
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    lines.append(line)
+                    if max_lines is not None and len(lines) >= max_lines:
+                        _kill_group(proc)
+                        status = "capped"
+                        break
+            if status == "capped":
+                break
+    if max_bytes is None and buf.strip():
+        lines.append(buf.decode("utf-8", "replace").strip())
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        proc.wait()
+        status = "timeout"
+    stderr_thread.join()
+    proc.stdout.close()
+    proc.stderr.close()
+    spool.seek(0)
+    stderr_tail = spool.read(HOOK_STDERR_CAP).decode("utf-8", "replace")
+    spool.close()
+    output: list[str] | bytes = lines if max_bytes is None else bytes(raw_out)
+    return status, output, stderr_tail, stderr_capped["v"], proc.returncode
+
 
 def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
     script = adapter.get("collect")
     if not script:
         return []
-    result = subprocess.run(
-        [os.path.join(adapter_dir, script)], capture_output=True, text=True,
-        timeout=120, cwd=adapter_dir,
-        env={**os.environ, "FORCE": "1" if force else ""},
+    status, output, stderr_tail, stderr_capped, returncode = _hook_run(
+        script, adapter_dir, HOOK_TIMEOUT_S, {"FORCE": "1" if force else ""},
+        max_lines=HOOK_EVENT_CAP,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"collect hook failed: {result.stderr.strip()[:300]}")
+    if stderr_capped:
+        log(f"{adapter['id']} collect hook: stderr capped at {HOOK_STDERR_CAP} bytes")
+    if status == "timeout":
+        raise RuntimeError(f"collect hook timed out: {stderr_tail.strip()[:300]}")
+    if status == "capped":
+        log(f"{adapter['id']} collect hook: stdout capped at {HOOK_EVENT_CAP} lines")
+    elif returncode != 0:
+        raise RuntimeError(f"collect hook failed: {stderr_tail.strip()[:300]}")
     events = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for line in output:
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
@@ -310,86 +475,121 @@ COLLECTORS = {
 }
 
 
-# ------------------------------------------------------------ aggregate
+# ------------------------------------------------------------ accumulate
 
-def aggregate(events: list[dict], now: datetime | None = None) -> dict:
+def fresh_stats() -> dict:
+    return {
+        "promptsTotal": 0,
+        "sessions": [], "sessionsEvicted": 0,
+        "activeDates": [], "activeDatesEvicted": 0,
+        "modelUsage": {},
+        "today": {"day": "", "prompts": 0, "tokens": 0,
+                  "sessions": [], "sessionsEvicted": 0, "tokensByModel": {}},
+        "days": {},
+    }
+
+
+def _model_key(mapping: dict, model: str) -> str:
+    if model in mapping or len(mapping) < MODEL_CAP:
+        return model
+    return "other"
+
+
+def merge_events(stats: dict, events: list[dict], now: datetime | None = None) -> None:
+    """Merge new events into a counter block. Memory is bounded by caps."""
     now = now or datetime.now()
     today = now.strftime("%Y-%m-%d")
-    days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+    t = stats["today"]
+    if t["day"] != today:
+        t.clear()
+        t.update({"day": today, "prompts": 0, "tokens": 0,
+                  "sessions": [], "sessionsEvicted": 0, "tokensByModel": {}})
+    cutoff = (now - timedelta(days=DAY_WINDOW - 1)).strftime("%Y-%m-%d")
+    stats["days"] = {d: v for d, v in stats["days"].items() if d >= cutoff}
 
-    recent_by_day = {d: 0 for d in days}
-    active_dates = set()
-    sessions_all = set()
-    sessions_today = set()
-    prompts_total = prompts_today = 0
-    sessions_today_count = 0
-    today_tokens = 0
-    tokens_by_model_today: dict[str, int] = {}
-    model_usage: dict[str, dict[str, int]] = {}
-
-    def bucket(model):
-        return model_usage.setdefault(model, {
-            "inputTokens": 0, "outputTokens": 0,
-            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0})
+    sessions = stats["sessions"]
+    sessions_seen = set(sessions)
+    active_dates = stats["activeDates"]
+    t_sessions = t["sessions"]
+    t_sessions_seen = set(t_sessions)
 
     for ev in events:
         d = day_key(ev["ts"])
-        active_dates.add(d)
         sid = ev["session"]
-        if sid:
-            sessions_all.add(sid)
         tokens = ev["input"] + ev["output"] + ev["cacheRead"] + ev["cacheWrite"]
-        recent_by_day[d] = recent_by_day.get(d, 0) + tokens
+        if sid:
+            if sid in sessions_seen:
+                pass
+            elif len(sessions) < SESSION_SET_CAP:
+                sessions.append(sid)
+                sessions_seen.add(sid)
+            else:
+                stats["sessionsEvicted"] += 1
+        if d not in active_dates:
+            bisect.insort(active_dates, d)
+            if len(active_dates) > ACTIVE_DATES_CAP:
+                active_dates.pop(0)
+                stats["activeDatesEvicted"] += 1
+        stats["days"][d] = stats["days"].get(d, 0) + tokens
         if ev["kind"] == "prompt":
-            prompts_total += 1
+            stats["promptsTotal"] += 1
             if d == today:
-                prompts_today += 1
+                t["prompts"] += 1
         else:
-            m = bucket(ev["model"])
-            m["inputTokens"] += ev["input"]
-            m["outputTokens"] += ev["output"]
-            m["cacheReadInputTokens"] += ev["cacheRead"]
-            m["cacheCreationInputTokens"] += ev["cacheWrite"]
+            bucket = stats["modelUsage"].setdefault(
+                _model_key(stats["modelUsage"], ev["model"]),
+                {"inputTokens": 0, "outputTokens": 0,
+                 "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0})
+            bucket["inputTokens"] += ev["input"]
+            bucket["outputTokens"] += ev["output"]
+            bucket["cacheReadInputTokens"] += ev["cacheRead"]
+            bucket["cacheCreationInputTokens"] += ev["cacheWrite"]
             if d == today:
-                today_tokens += tokens
-                tokens_by_model_today[ev["model"]] = tokens_by_model_today.get(ev["model"], 0) + tokens
+                t["tokens"] += tokens
+                key = _model_key(t["tokensByModel"], ev["model"])
+                t["tokensByModel"][key] = t["tokensByModel"].get(key, 0) + tokens
         if d == today and sid:
-            if sid not in sessions_today:
-                sessions_today.add(sid)
-                sessions_today_count += 1
-
-    return {
-        "todayPrompts": prompts_today,
-        "todaySessions": sessions_today_count,
-        "todayTotalTokens": today_tokens,
-        "todayTokensByModel": tokens_by_model_today,
-        "recentDays": [{"date": d, "messageCount": recent_by_day[d]} for d in days],
-        "totalPrompts": prompts_total,
-        "totalSessions": len(sessions_all),
-        "activeDays": len(active_dates),
-        "activeDates": sorted(active_dates),
-        "modelUsage": model_usage,
-    }
+            if sid not in t_sessions_seen:
+                if len(t_sessions) < SESSION_SET_CAP:
+                    t_sessions.append(sid)
+                else:
+                    t["sessionsEvicted"] += 1
+                t_sessions_seen.add(sid)
 
 
 # -------------------------------------------------------------- records
 
-def build_record(adapter_id: str, name: str, events: list[dict], limits: list,
-                 status_text: str = "", auth_help: str = "", tier_label: str = "") -> dict:
-    record = {
+def build_record(adapter_id: str, name: str, stats: dict, limits: list,
+                 status_text: str = "", auth_help: str = "", tier_label: str = "",
+                 now: datetime | None = None) -> dict:
+    today = stats["today"]
+    now = now or datetime.now()
+    recent = []
+    for i in range(DAY_WINDOW - 2, -1, -1):
+        d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        recent.append({"date": d, "messageCount": stats["days"].get(d, 0)})
+    return {
         "schemaVersion": SCHEMA_VERSION,
         "id": adapter_id,
         "name": name,
-        "updatedAt": datetime.now().astimezone().isoformat(),
+        "updatedAt": now.astimezone().isoformat(),
         "ready": True,
         "hasLocalStats": True,
-        **aggregate(events),
+        "todayPrompts": today["prompts"],
+        "todaySessions": len(today["sessions"]) + today["sessionsEvicted"],
+        "todayTotalTokens": today["tokens"],
+        "todayTokensByModel": today["tokensByModel"],
+        "recentDays": recent,
+        "totalPrompts": stats["promptsTotal"],
+        "totalSessions": len(stats["sessions"]) + stats["sessionsEvicted"],
+        "activeDays": len(stats["activeDates"]) + stats["activeDatesEvicted"],
+        "activeDates": list(stats["activeDates"]),
+        "modelUsage": stats["modelUsage"],
         "limits": limits or [],
         "tierLabel": tier_label,
         "usageStatusText": status_text,
         "authHelpText": auth_help,
     }
-    return record
 
 
 def write_record(record: dict, usage_dir: str) -> None:
@@ -516,34 +716,47 @@ def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> list:
     script = manifest.get("limits")
     if not script:
         return []
-    try:
-        result = subprocess.run([os.path.join(adapter_dir, script)],
-                                capture_output=True, text=True, timeout=30, cwd=adapter_dir)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"{manifest['id']} limits hook: {e}")
+    status, output, stderr_tail, stderr_capped, returncode = _hook_run(
+        script, adapter_dir, LIMITS_TIMEOUT_S, None, max_bytes=HOOK_STDOUT_CAP,
+    )
+    if stderr_capped:
+        log(f"{manifest['id']} limits hook: stderr capped at {HOOK_STDERR_CAP} bytes")
+    if status == "timeout":
+        log(f"{manifest['id']} limits hook: timed out")
         return []
-    if result.returncode != 0:  # optional by contract: exit 1 == no data
+    if status == "capped":
+        log(f"{manifest['id']} limits hook: stdout capped at {HOOK_STDOUT_CAP} bytes")
+    if returncode != 0:  # optional by contract: exit 1 == no data
         return []
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(output)
         return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return []
 
 
 # ---------------------------------------------------------------- main
 
 def load_state() -> dict:
+    """Load v2 state. v1 or oversized state is ignored: one full rescan
+    rebuilds all counters, so no history is lost and no unbounded allocation
+    happens during the upgrade."""
     try:
+        if os.path.getsize(STATE_FILE) > STATE_LOAD_GUARD:
+            log(f"state file exceeds {STATE_LOAD_GUARD} bytes; ignoring it")
+            return {}
         with open(STATE_FILE) as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict) or data.get("schemaVersion") != STATE_SCHEMA_VERSION:
+            return {}
+        return data
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def save_state(state: dict) -> None:
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    state["schemaVersion"] = STATE_SCHEMA_VERSION
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE), prefix=".state.")
     try:
         with os.fdopen(fd, "w") as fh:
@@ -579,7 +792,7 @@ def main(argv=None) -> int:
 
     wanted = set(args.ids)
     excluded = set(args.except_ids)
-    state = {} if args.force else load_state()
+    state = load_state()
 
     status = 0
     ran_any = False
@@ -606,13 +819,20 @@ def main(argv=None) -> int:
             hook = manifest.get("collect")
             if hook:
                 events.extend(collect_hook({**manifest, "collect": hook}, adapter_dir, state, args.force))
-            record = build_record(aid, manifest["name"], events,
+            all_stats = state.setdefault("stats", {})
+            stats = all_stats.get(aid)
+            if stats is None or args.force:  # force rebuilds counters from the full scan
+                stats = fresh_stats()
+                all_stats[aid] = stats
+            merge_events(stats, events)
+            record = build_record(aid, manifest["name"], stats,
                                   run_limits_hook(manifest, adapter_dir, args.force),
                                   status_text=manifest.get("usageStatusText", ""),
                                   auth_help=manifest.get("authHelpText", ""),
                                   tier_label=manifest.get("tierLabel", ""))
+            save_state(state)  # persist cursors+counters before the record
             write_record(record, args.usage_dir)
-            print(f"{aid}: {len(events)} events -> {aid}.json")
+            print(f"{aid}: {len(events)} new events -> {aid}.json")
         except Exception as e:  # isolation: one adapter never blocks others
             log(f"{aid}: FAILED {e}")
             status = 1

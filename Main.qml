@@ -17,9 +17,23 @@ Item {
     id: collectorProcess
     running: false
 
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agent-collectors", text.trim())
+    readonly property int maxErrBytes: 1048576
+    property int errBytes: 0
+
+    // SplitParser streams stderr line by line; StdioCollector would buffer
+    // everything until process end. A hard byte cap detaches the parser so a
+    // pathological engine can never force unbounded allocation here.
+    stderr: SplitParser {
+      id: errParser
+      onRead: function(data) {
+        if (root.errBytes > root.maxErrBytes) {
+          collectorProcess.stderr = null
+          console.warn("agent-collectors", "stderr cap exceeded; detached")
+          return
+        }
+        root.errBytes += data.length
+        if (data.trim() !== "") console.warn("agent-collectors", data.trim())
+      }
     }
 
     onExited: function(exitCode) {
