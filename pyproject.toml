@@ -1,0 +1,3 @@
+# Project metadata for static analysis only; the plugin is stdlib-only at runtime.
+[tool.ty.environment]
+root = [".", "./bin"]

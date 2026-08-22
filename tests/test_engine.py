@@ -1,24 +1,19 @@
 """Tests for bin/agent-collectors (stdlib unittest). Run: python3 -m unittest discover tests"""
 
-import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import ClassVar
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENGINE_PATH = os.path.join(REPO, "bin", "agent-collectors")
+sys.path.insert(0, os.path.join(REPO, "bin"))
 
-from importlib.machinery import SourceFileLoader
-from importlib.util import module_from_spec
-
-loader = SourceFileLoader("agent_collectors", ENGINE_PATH)
-spec = importlib.util.spec_from_loader("agent_collectors", loader)
-ac = module_from_spec(spec)
-loader.exec_module(ac)
+import agent_collectors as ac  # symlink bin/agent_collectors.py -> agent-collectors
 
 
 # Collectors are generators; tests consume them eagerly.
@@ -34,7 +29,9 @@ def ch(*a, **k):
     return list(ac.collect_hook(*a, **k))
 
 
-def ev(ts, session="s1", model="m", kind="completion", inp=10, out=5, cr=2, cw=1):
+def ev(
+    ts, session="s1", model="m", kind="completion", inp=10, out=5, cr=2, cw=1
+):
     if kind == "prompt":
         inp = out = cr = cw = 0
     return ac.make_event(ts, session, model, kind, inp, out, cr, cw)
@@ -42,7 +39,7 @@ def ev(ts, session="s1", model="m", kind="completion", inp=10, out=5, cr=2, cw=1
 
 class TestAccumulator(unittest.TestCase):
     def test_totals_today_recent_models(self):
-        now = datetime(2026, 8, 21, 18, 0, 0)
+        now = datetime(2026, 8, 21, 18, 0, 0, tzinfo=timezone.utc)
         events = [
             ev("2026-08-21T10:00:00Z", "a", "alpha"),
             ev("2026-08-21T11:00:00Z", "b", "beta", "prompt"),
@@ -59,20 +56,36 @@ class TestAccumulator(unittest.TestCase):
         self.assertEqual(rec["totalPrompts"], 1)
         self.assertEqual(rec["totalSessions"], 4)
         self.assertEqual(rec["activeDays"], 3)
-        self.assertEqual([d["date"] for d in rec["recentDays"]],
-                         ["2026-08-15", "2026-08-16", "2026-08-17", "2026-08-18",
-                          "2026-08-19", "2026-08-20", "2026-08-21"])
+        self.assertEqual(
+            [d["date"] for d in rec["recentDays"]],
+            [
+                "2026-08-15",
+                "2026-08-16",
+                "2026-08-17",
+                "2026-08-18",
+                "2026-08-19",
+                "2026-08-20",
+                "2026-08-21",
+            ],
+        )
         by_date = {d["date"]: d["messageCount"] for d in rec["recentDays"]}
         self.assertEqual(by_date["2026-08-21"], 18)  # tokens, not messages
         self.assertEqual(by_date["2026-08-15"], 18)
         mu = rec["modelUsage"]["alpha"]
-        self.assertEqual(mu, {"inputTokens": 20, "outputTokens": 10,
-                              "cacheReadInputTokens": 4, "cacheCreationInputTokens": 2})
+        self.assertEqual(
+            mu,
+            {
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "cacheReadInputTokens": 4,
+                "cacheCreationInputTokens": 2,
+            },
+        )
         self.assertEqual(rec["todayTokensByModel"], {"alpha": 18})
 
     def test_incremental_merge_matches_full_aggregation(self):
         """Merging new events run by run equals merging everything at once."""
-        now = datetime(2026, 8, 21, 18, 0, 0)
+        now = datetime(2026, 8, 21, 18, 0, 0, tzinfo=timezone.utc)
         all_events = [
             ev("2026-08-21T10:00:00Z", "a", "alpha"),
             ev("2026-08-21T11:00:00Z", "b", "beta", "prompt"),
@@ -93,10 +106,16 @@ class TestAccumulator(unittest.TestCase):
 
     def test_day_rollover_resets_today(self):
         stats = ac.fresh_stats()
-        ac.merge_events(stats, [ev("2026-08-20T10:00:00Z", "a", "alpha")],
-                        now=datetime(2026, 8, 20, 18, 0, 0))
-        ac.merge_events(stats, [ev("2026-08-21T10:00:00Z", "b", "beta")],
-                        now=datetime(2026, 8, 21, 18, 0, 0))
+        ac.merge_events(
+            stats,
+            [ev("2026-08-20T10:00:00Z", "a", "alpha")],
+            now=datetime(2026, 8, 20, 18, 0, 0, tzinfo=timezone.utc),
+        )
+        ac.merge_events(
+            stats,
+            [ev("2026-08-21T10:00:00Z", "b", "beta")],
+            now=datetime(2026, 8, 21, 18, 0, 0, tzinfo=timezone.utc),
+        )
         rec = ac.build_record("x", "X", stats, [])
         self.assertEqual(rec["todayPrompts"], 0)
         self.assertEqual(rec["todaySessions"], 1)
@@ -118,7 +137,9 @@ class TestAccumulator(unittest.TestCase):
     def test_model_cap_routes_to_other(self):
         stats = ac.fresh_stats()
         for i in range(ac.MODEL_CAP + 3):
-            ac.merge_events(stats, [ev("2026-08-21T10:00:00Z", "s", f"model{i}")])
+            ac.merge_events(
+                stats, [ev("2026-08-21T10:00:00Z", "s", f"model{i}")]
+            )
         # MODEL_CAP distinct models plus the "other" bucket
         self.assertEqual(len(stats["modelUsage"]), ac.MODEL_CAP + 1)
         self.assertIn("other", stats["modelUsage"])
@@ -128,11 +149,27 @@ class TestAccumulator(unittest.TestCase):
 
 
 class TestRecordContract(unittest.TestCase):
-    CONTRACT_KEYS = {
-        "schemaVersion", "id", "name", "updatedAt", "ready", "hasLocalStats",
-        "todayPrompts", "todaySessions", "todayTotalTokens", "todayTokensByModel",
-        "recentDays", "totalPrompts", "totalSessions", "activeDays", "activeDates",
-        "modelUsage", "limits", "tierLabel", "usageStatusText", "authHelpText",
+    CONTRACT_KEYS: ClassVar[set[str]] = {
+        "schemaVersion",
+        "id",
+        "name",
+        "updatedAt",
+        "ready",
+        "hasLocalStats",
+        "todayPrompts",
+        "todaySessions",
+        "todayTotalTokens",
+        "todayTokensByModel",
+        "recentDays",
+        "totalPrompts",
+        "totalSessions",
+        "activeDays",
+        "activeDates",
+        "modelUsage",
+        "limits",
+        "tierLabel",
+        "usageStatusText",
+        "authHelpText",
     }
 
     def test_record_has_full_contract(self):
@@ -150,15 +187,27 @@ class TestRecordContract(unittest.TestCase):
                 self.skipTest(f"{name} not present")
             with open(path) as fh:
                 live = json.load(fh)
-            self.assertFalse(set(live) - set(rec),
-                             f"record missing live keys: {set(live) - set(rec)}")
+            self.assertFalse(
+                set(live) - set(rec),
+                f"record missing live keys: {set(live) - set(rec)}",
+            )
 
 
 class TestJsonlCollector(unittest.TestCase):
-    PI_LINE = {
-        "type": "message", "id": "m1", "timestamp": "2026-08-21T10:00:00Z",
-        "message": {"role": "assistant", "model": "mimo-v2.5-pro",
-                    "usage": {"input": 100, "output": 20, "cacheRead": 50, "cacheWrite": 7}},
+    PI_LINE: ClassVar[dict] = {
+        "type": "message",
+        "id": "m1",
+        "timestamp": "2026-08-21T10:00:00Z",
+        "message": {
+            "role": "assistant",
+            "model": "mimo-v2.5-pro",
+            "usage": {
+                "input": 100,
+                "output": 20,
+                "cacheRead": 50,
+                "cacheWrite": 7,
+            },
+        },
     }
 
     def setUp(self):
@@ -181,11 +230,19 @@ class TestJsonlCollector(unittest.TestCase):
         return {
             "format": "jsonl-lines",
             "glob": os.path.join(self.tmp, "**/*.jsonl"),
-            "kindPath": "type", "kinds": ["message"],
-            "rolePath": "message.role", "promptRole": "user", "completionRole": "assistant",
-            "timestampPath": "timestamp", "modelPath": "message.model",
-            "tokens": {"input": "message.usage.input", "output": "message.usage.output",
-                       "cacheRead": "message.usage.cacheRead", "cacheWrite": "message.usage.cacheWrite"},
+            "kindPath": "type",
+            "kinds": ["message"],
+            "rolePath": "message.role",
+            "promptRole": "user",
+            "completionRole": "assistant",
+            "timestampPath": "timestamp",
+            "modelPath": "message.model",
+            "tokens": {
+                "input": "message.usage.input",
+                "output": "message.usage.output",
+                "cacheRead": "message.usage.cacheRead",
+                "cacheWrite": "message.usage.cacheWrite",
+            },
         }
 
     def test_parse_and_incremental_cursor(self):
@@ -206,11 +263,16 @@ class TestJsonlCollector(unittest.TestCase):
         self.assertEqual(grown[0]["input"], 100)
 
     def test_user_message_counts_as_prompt(self):
-        self.write_session([
-            {"type": "message", "timestamp": "2026-08-21T10:00:00Z",
-             "message": {"role": "user", "content": []}},
-            self.PI_LINE,
-        ])
+        self.write_session(
+            [
+                {
+                    "type": "message",
+                    "timestamp": "2026-08-21T10:00:00Z",
+                    "message": {"role": "user", "content": []},
+                },
+                self.PI_LINE,
+            ]
+        )
         events = cj(self.source(), self.tmp, self.state, force=False)
         kinds = sorted(e["kind"] for e in events)
         self.assertEqual(kinds, ["completion", "prompt"])
@@ -229,20 +291,28 @@ class TestJsonlCollector(unittest.TestCase):
         p = os.path.join(self.tmp, "sess1.jsonl")
         with open(p, "w") as fh:
             fh.write(json.dumps(self.PI_LINE) + "\n")
-            fh.write('{"type": "message", "timestamp": "2026-08-2')  # partial line, no newline
+            fh.write(
+                '{"type": "message", "timestamp": "2026-08-2'
+            )  # partial line, no newline
         first = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(first), 1)
         # continuation arrives: the stored tail is re-attached and parsed once
         with open(p, "a") as fh:
-            fh.write('1T10:00:00Z", "message": {"role": "assistant", "model": "m", "usage": {}}}')
+            fh.write(
+                '1T10:00:00Z", "message": {"role": "assistant", "model": "m", "usage": {}}}'
+            )
             fh.write("\n")
             fh.write(json.dumps(dict(self.PI_LINE, id="m2")) + "\n")
         after = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(after), 2)
-        self.assertEqual(after[0]["model"], "m")  # the re-attached straddle line
-        self.assertEqual(after[1]["input"], 100)   # the appended message
+        self.assertEqual(
+            after[0]["model"], "m"
+        )  # the re-attached straddle line
+        self.assertEqual(after[1]["input"], 100)  # the appended message
         # nothing re-read on a third run
-        self.assertEqual(cj(self.source(), self.tmp, self.state, force=False), [])
+        self.assertEqual(
+            cj(self.source(), self.tmp, self.state, force=False), []
+        )
 
     def test_rotated_and_regrown_file_rescans(self):
         self.write_session([self.PI_LINE, dict(self.PI_LINE, id="m2")])
@@ -250,10 +320,15 @@ class TestJsonlCollector(unittest.TestCase):
         self.assertEqual(len(first), 2)
         size_before = os.path.getsize(os.path.join(self.tmp, "sess1.jsonl"))
         # replace with different content that grows past the old offset
-        lines = [dict(self.PI_LINE, id="m3"), dict(self.PI_LINE, id="m4"),
-                 dict(self.PI_LINE, id="m5", timestamp="2026-08-21T11:00:00Z")]
+        lines = [
+            dict(self.PI_LINE, id="m3"),
+            dict(self.PI_LINE, id="m4"),
+            dict(self.PI_LINE, id="m5", timestamp="2026-08-21T11:00:00Z"),
+        ]
         self.write_session(lines)
-        self.assertGreater(os.path.getsize(os.path.join(self.tmp, "sess1.jsonl")), size_before)
+        self.assertGreater(
+            os.path.getsize(os.path.join(self.tmp, "sess1.jsonl")), size_before
+        )
         after = cj(self.source(), self.tmp, self.state, force=False)
         self.assertEqual(len(after), 3)  # head mismatch forced a full rescan
 
@@ -269,12 +344,27 @@ class TestSqliteCollector(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "test.db")
         con = sqlite3.connect(self.db)
-        con.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text, time_created integer, data text)")
+        con.execute(
+            "CREATE TABLE message (id text PRIMARY KEY, session_id text, time_created integer, data text)"
+        )
         rows = [
             ("u1", "s1", 1755770400000, json.dumps({"role": "user"})),
-            ("a1", "s1", 1755770401000, json.dumps({"role": "assistant", "modelID": "qwen",
-                                                    "tokens": {"input": 9, "output": 3,
-                                                               "cache": {"read": 4, "write": 2}}})),
+            (
+                "a1",
+                "s1",
+                1755770401000,
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "modelID": "qwen",
+                        "tokens": {
+                            "input": 9,
+                            "output": 3,
+                            "cache": {"read": 4, "write": 2},
+                        },
+                    }
+                ),
+            ),
         ]
         con.executemany("INSERT INTO message VALUES (?,?,?,?)", rows)
         con.commit()
@@ -285,17 +375,27 @@ class TestSqliteCollector(unittest.TestCase):
             "format": "sqlite-query",
             "database": self.db,
             "timestampUnit": "ms",
-            "promptRole": "user", "completionRole": "assistant",
-            "query": ("SELECT session_id, time_created, json_extract(data,'$.role') AS role,"
-                      " json_extract(data,'$.modelID') AS model,"
-                      " json_extract(data,'$.tokens.input') AS tin,"
-                      " json_extract(data,'$.tokens.output') AS tout,"
-                      " json_extract(data,'$.tokens.cache.read') AS tcr,"
-                      " json_extract(data,'$.tokens.cache.write') AS tcw FROM message"
-                      " ORDER BY time_created"),
-            "columns": {"ts": "time_created", "sessionId": "session_id", "role": "role",
-                        "model": "model", "input": "tin", "output": "tout",
-                        "cacheRead": "tcr", "cacheWrite": "tcw"},
+            "promptRole": "user",
+            "completionRole": "assistant",
+            "query": (
+                "SELECT session_id, time_created, json_extract(data,'$.role') AS role,"
+                " json_extract(data,'$.modelID') AS model,"
+                " json_extract(data,'$.tokens.input') AS tin,"
+                " json_extract(data,'$.tokens.output') AS tout,"
+                " json_extract(data,'$.tokens.cache.read') AS tcr,"
+                " json_extract(data,'$.tokens.cache.write') AS tcw FROM message"
+                " ORDER BY time_created"
+            ),
+            "columns": {
+                "ts": "time_created",
+                "sessionId": "session_id",
+                "role": "role",
+                "model": "model",
+                "input": "tin",
+                "output": "tout",
+                "cacheRead": "tcr",
+                "cacheWrite": "tcw",
+            },
         }
 
     def test_events_from_db_and_incremental_last_ts(self):
@@ -311,10 +411,25 @@ class TestSqliteCollector(unittest.TestCase):
 
         # append one row -> only the new row is returned
         con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO message VALUES (?,?,?,?)",
-                    ("a2", "s2", 1755770402000, json.dumps({"role": "assistant", "modelID": "qwen",
-                                                            "tokens": {"input": 1, "output": 2,
-                                                                       "cache": {"read": 3, "write": 4}}})))
+        con.execute(
+            "INSERT INTO message VALUES (?,?,?,?)",
+            (
+                "a2",
+                "s2",
+                1755770402000,
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "modelID": "qwen",
+                        "tokens": {
+                            "input": 1,
+                            "output": 2,
+                            "cache": {"read": 3, "write": 4},
+                        },
+                    }
+                ),
+            ),
+        )
         con.commit()
         con.close()
         grown = cs(self.source(), self.tmp, state, force=False)
@@ -333,10 +448,25 @@ class TestSqliteCollector(unittest.TestCase):
         self.assertEqual(len(first), 2)
         # append a row with the SAME ts as the last seen row
         con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO message VALUES (?,?,?,?)",
-                    ("a3", "s3", 1755770401000, json.dumps({"role": "assistant", "modelID": "qwen",
-                                                              "tokens": {"input": 5, "output": 5,
-                                                                         "cache": {"read": 0, "write": 0}}})))
+        con.execute(
+            "INSERT INTO message VALUES (?,?,?,?)",
+            (
+                "a3",
+                "s3",
+                1755770401000,
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "modelID": "qwen",
+                        "tokens": {
+                            "input": 5,
+                            "output": 5,
+                            "cache": {"read": 0, "write": 0},
+                        },
+                    }
+                ),
+            ),
+        )
         con.commit()
         con.close()
         grown = cs(self.source(), self.tmp, state, force=False)
@@ -361,16 +491,24 @@ class TestHookBounding(unittest.TestCase):
 
     def test_collect_hook_streams_events(self):
         with open(self.script, "w") as fh:
-            fh.write('#!/bin/sh\necho \'{"ts": "2026-08-21T10:00:00Z", "session": "s1", "kind": "completion", "input": 1}\'\n')
-        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+            fh.write(
+                '#!/bin/sh\necho \'{"ts": "2026-08-21T10:00:00Z", "session": "s1", "kind": "completion", "input": 1}\'\n'
+            )
+        events = ch(
+            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+        )
         self.assertEqual(len(events), 1)
 
     def test_collect_hook_output_capped(self):
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\n")
-            for _ in range(ac.HOOK_EVENT_CAP + 50):
-                fh.write('echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n')
-        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+            fh.writelines(
+                'echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n'
+                for _ in range(ac.HOOK_EVENT_CAP + 50)
+            )
+        events = ch(
+            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+        )
         self.assertEqual(len(events), ac.HOOK_EVENT_CAP)
 
     def test_collect_hook_timeout_kills(self):
@@ -380,7 +518,12 @@ class TestHookBounding(unittest.TestCase):
         ac.HOOK_TIMEOUT_S = 2
         try:
             with self.assertRaises(RuntimeError):
-                ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+                ch(
+                    {"id": "x", "collect": "collect.sh"},
+                    self.tmp,
+                    {},
+                    force=False,
+                )
         finally:
             ac.HOOK_TIMEOUT_S = old
 
@@ -393,19 +536,30 @@ class TestHookBounding(unittest.TestCase):
 
     def test_limits_hook_capped_and_optional(self):
         with open(self.script, "w") as fh:
-            fh.write("#!/bin/sh\necho '[{\"kind\": \"tier\"}]'\n")
-        limits = ac.run_limits_hook({"id": "x", "limits": "collect.sh"}, self.tmp, force=False)
+            fh.write('#!/bin/sh\necho \'[{"kind": "tier"}]\'\n')
+        limits = ac.run_limits_hook(
+            {"id": "x", "limits": "collect.sh"}, self.tmp, force=False
+        )
         self.assertEqual(limits, [{"kind": "tier"}])
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\nexit 1\n")
-        self.assertEqual(ac.run_limits_hook({"id": "x", "limits": "collect.sh"}, self.tmp, force=False), [])
+        self.assertEqual(
+            ac.run_limits_hook(
+                {"id": "x", "limits": "collect.sh"}, self.tmp, force=False
+            ),
+            [],
+        )
 
     def test_single_giant_line_capped(self):
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\n")
             fh.write("head -c 2097152 /dev/zero | tr '\\0' 'a'\n")
-            fh.write("echo '{\"ts\": \"2026-08-21T10:00:00Z\", \"session\": \"s\", \"kind\": \"completion\"}'\n")
-        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+            fh.write(
+                'echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n'
+            )
+        events = ch(
+            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+        )
         self.assertEqual(events, [])
 
     def test_daemonized_hook_does_not_hang(self):
@@ -413,9 +567,13 @@ class TestHookBounding(unittest.TestCase):
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\n")
             fh.write("setsid sh -c 'sleep 4' >/dev/null &\n")
-            fh.write("echo '{\"ts\": \"2026-08-21T10:00:00Z\", \"session\": \"s\", \"kind\": \"completion\"}'\n")
+            fh.write(
+                'echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n'
+            )
         t0 = time.monotonic()
-        events = ch({"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False)
+        events = ch(
+            {"id": "x", "collect": "collect.sh"}, self.tmp, {}, force=False
+        )
         self.assertEqual(len(events), 1)
         self.assertLess(time.monotonic() - t0, 10)
 
@@ -423,11 +581,20 @@ class TestHookBounding(unittest.TestCase):
 class TestHookDedupe(unittest.TestCase):
     def test_duplicate_events_merged_once(self):
         stats = ac.fresh_stats()
-        events = [ev("2026-08-21T10:00:00Z", "s1", "m"),
-                  ev("2026-08-21T10:00:01Z", "s2", "m")]
+        events = [
+            ev("2026-08-21T10:00:00Z", "s1", "m"),
+            ev("2026-08-21T10:00:01Z", "s2", "m"),
+        ]
         self.assertEqual(ac.merge_hook_events(stats, events), 2)
-        self.assertEqual(ac.merge_hook_events(stats, events), 0)  # re-emitted history
-        self.assertEqual(ac.merge_hook_events(stats, [ev("2026-08-21T10:00:02Z", "s3", "m")]), 1)
+        self.assertEqual(
+            ac.merge_hook_events(stats, events), 0
+        )  # re-emitted history
+        self.assertEqual(
+            ac.merge_hook_events(
+                stats, [ev("2026-08-21T10:00:02Z", "s3", "m")]
+            ),
+            1,
+        )
         rec = ac.build_record("x", "X", stats, [])
         self.assertEqual(rec["totalSessions"], 3)
 
@@ -436,7 +603,9 @@ class TestHookDedupe(unittest.TestCase):
         old = ac.HOOK_FP_CAP
         ac.HOOK_FP_CAP = 10
         try:
-            events = [ev(f"2026-08-21T10:00:0{i}Z", f"s{i}", "m") for i in range(15)]
+            events = [
+                ev(f"2026-08-21T10:00:0{i}Z", f"s{i}", "m") for i in range(15)
+            ]
             self.assertEqual(ac.merge_hook_events(stats, events), 15)
             self.assertEqual(len(stats["hookFp"]), 10)
         finally:
@@ -456,21 +625,41 @@ class TestFailureIsolation(unittest.TestCase):
         self.ad = os.path.join(self.tmp, "adapters", "bad")
         os.makedirs(self.ad)
         with open(os.path.join(self.ad, "manifest.json"), "w") as fh:
-            json.dump({"schemaVersion": 1, "id": "bad", "name": "Bad",
-                       "sources": [{"format": "jsonl-lines",
-                                     "glob": os.path.join(self.tmp, "*.jsonl"),
-                                     "kindPath": "type", "kinds": ["message"],
-                                     "rolePath": "message.role",
-                                     "promptRole": "user", "completionRole": "assistant",
-                                     "timestampPath": "timestamp", "modelPath": "message.model",
-                                     "tokens": {"input": "message.usage.input",
-                                                 "output": "message.usage.output",
-                                                 "cacheRead": "message.usage.cacheRead",
-                                                 "cacheWrite": "message.usage.cacheWrite"}}]}, fh)
+            json.dump(
+                {
+                    "schemaVersion": 1,
+                    "id": "bad",
+                    "name": "Bad",
+                    "sources": [
+                        {
+                            "format": "jsonl-lines",
+                            "glob": os.path.join(self.tmp, "*.jsonl"),
+                            "kindPath": "type",
+                            "kinds": ["message"],
+                            "rolePath": "message.role",
+                            "promptRole": "user",
+                            "completionRole": "assistant",
+                            "timestampPath": "timestamp",
+                            "modelPath": "message.model",
+                            "tokens": {
+                                "input": "message.usage.input",
+                                "output": "message.usage.output",
+                                "cacheRead": "message.usage.cacheRead",
+                                "cacheWrite": "message.usage.cacheWrite",
+                            },
+                        }
+                    ],
+                },
+                fh,
+            )
         self.usage = os.path.join(self.tmp, "usage")
         os.makedirs(self.usage)
-        self.args = ["--adapters-dir", os.path.join(self.tmp, "adapters"),
-                     "--usage-dir", self.usage]
+        self.args = [
+            "--adapters-dir",
+            os.path.join(self.tmp, "adapters"),
+            "--usage-dir",
+            self.usage,
+        ]
 
     def tearDown(self):
         ac.STATE_FILE = self.old_state
@@ -510,10 +699,25 @@ class TestFailureIsolation(unittest.TestCase):
         """Regression: committed cursors must be visible to the next run."""
         ac.COLLECTORS.update(self.old_collectors)
         with open(os.path.join(self.tmp, "sess.jsonl"), "w") as fh:
-            fh.write(json.dumps({"type": "message", "timestamp": "2026-08-21T10:00:00Z",
-                                 "message": {"role": "assistant", "model": "m",
-                                              "usage": {"input": 1, "output": 2,
-                                                         "cacheRead": 3, "cacheWrite": 4}}}) + "\n")
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "timestamp": "2026-08-21T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "m",
+                            "usage": {
+                                "input": 1,
+                                "output": 2,
+                                "cacheRead": 3,
+                                "cacheWrite": 4,
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
         self.assertEqual(ac.main(self.args), 0)
         with open(ac.STATE_FILE) as fh:
             state = json.load(fh)
@@ -524,7 +728,9 @@ class TestFailureIsolation(unittest.TestCase):
         with open(ac.STATE_FILE) as fh:
             state = json.load(fh)
         self.assertEqual(state["stats"]["bad"]["sessions"], sessions_before)
-        self.assertEqual(state["stats"]["bad"]["modelUsage"]["m"]["inputTokens"], 1)
+        self.assertEqual(
+            state["stats"]["bad"]["modelUsage"]["m"]["inputTokens"], 1
+        )
 
 
 class TestStateLifecycle(unittest.TestCase):
@@ -543,7 +749,9 @@ class TestStateLifecycle(unittest.TestCase):
 
     def test_v2_state_ignored_and_rebuilt(self):
         with open(ac.STATE_FILE, "w") as fh:
-            json.dump({"schemaVersion": 2, "stats": {"pi": {"promptsTotal": 9}}}, fh)
+            json.dump(
+                {"schemaVersion": 2, "stats": {"pi": {"promptsTotal": 9}}}, fh
+            )
         self.assertEqual(ac.load_state(), {})
 
     def test_v2_state_roundtrip(self):
@@ -568,13 +776,20 @@ class TestStateLifecycle(unittest.TestCase):
         con.execute("INSERT INTO m VALUES (1, 'user')")
         con.commit()
         con.close()
-        src = {"format": "sqlite-query", "database": db, "promptRole": "user",
-               "completionRole": "assistant",
-               "query": "SELECT ts, role FROM m", "columns": {"ts": "ts", "role": "role"}}
+        src = {
+            "format": "sqlite-query",
+            "database": db,
+            "promptRole": "user",
+            "completionRole": "assistant",
+            "query": "SELECT ts, role FROM m",
+            "columns": {"ts": "ts", "role": "role"},
+        }
         cs(src, "", state, force=False)
         self.assertNotIn("events", json.dumps(state))
-        self.assertEqual(set(state),
-                         {"schemaVersion"} | {k for k in state if k.startswith("sqlite:")})
+        self.assertEqual(
+            set(state),
+            {"schemaVersion"} | {k for k in state if k.startswith("sqlite:")},
+        )
 
 
 class TestStreaming(unittest.TestCase):
@@ -582,24 +797,44 @@ class TestStreaming(unittest.TestCase):
         return {
             "format": "jsonl-lines",
             "glob": os.path.join(tmp, "**/*.jsonl"),
-            "kindPath": "type", "kinds": ["message"],
-            "rolePath": "message.role", "promptRole": "user", "completionRole": "assistant",
-            "timestampPath": "timestamp", "modelPath": "message.model",
-            "tokens": {"input": "message.usage.input", "output": "message.usage.output",
-                       "cacheRead": "message.usage.cacheRead", "cacheWrite": "message.usage.cacheWrite"},
+            "kindPath": "type",
+            "kinds": ["message"],
+            "rolePath": "message.role",
+            "promptRole": "user",
+            "completionRole": "assistant",
+            "timestampPath": "timestamp",
+            "modelPath": "message.model",
+            "tokens": {
+                "input": "message.usage.input",
+                "output": "message.usage.output",
+                "cacheRead": "message.usage.cacheRead",
+                "cacheWrite": "message.usage.cacheWrite",
+            },
         }
 
     def test_large_history_streams_without_materializing(self):
         import types
+
         tmp = tempfile.mkdtemp()
         n = 20000
-        line = json.dumps({"type": "message", "timestamp": "2026-08-21T10:00:00Z",
-                           "message": {"role": "assistant", "model": "m",
-                                        "usage": {"input": 1, "output": 2,
-                                                   "cacheRead": 3, "cacheWrite": 4}}})
+        line = json.dumps(
+            {
+                "type": "message",
+                "timestamp": "2026-08-21T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "m",
+                    "usage": {
+                        "input": 1,
+                        "output": 2,
+                        "cacheRead": 3,
+                        "cacheWrite": 4,
+                    },
+                },
+            }
+        )
         with open(os.path.join(tmp, "big.jsonl"), "w") as fh:
-            for _ in range(n):
-                fh.write(line + "\n")
+            fh.writelines(line + "\n" for _ in range(n))
         state = {}
         gen = ac.collect_jsonl_lines(self.source(tmp), tmp, state, force=False)
         self.assertIsInstance(gen, types.GeneratorType)
@@ -616,16 +851,24 @@ class TestStreaming(unittest.TestCase):
 
     def test_sqlite_streams_row_by_row(self):
         import types
+
         tmp = tempfile.mkdtemp()
         db = os.path.join(tmp, "t.db")
         con = sqlite3.connect(db)
         con.execute("CREATE TABLE m (ts integer, role text)")
-        con.executemany("INSERT INTO m VALUES (?,?)", [(i, "user") for i in range(100)])
+        con.executemany(
+            "INSERT INTO m VALUES (?,?)", [(i, "user") for i in range(100)]
+        )
         con.commit()
         con.close()
-        src = {"format": "sqlite-query", "database": db, "promptRole": "user",
-               "completionRole": "assistant", "query": "SELECT ts, role FROM m",
-               "columns": {"ts": "ts", "role": "role"}}
+        src = {
+            "format": "sqlite-query",
+            "database": db,
+            "promptRole": "user",
+            "completionRole": "assistant",
+            "query": "SELECT ts, role FROM m",
+            "columns": {"ts": "ts", "role": "role"},
+        }
         state = {}
         gen = ac.collect_sqlite_query(src, tmp, state, force=False)
         self.assertIsInstance(gen, types.GeneratorType)
@@ -636,8 +879,12 @@ class TestStreaming(unittest.TestCase):
 
 class TestManifestValidation(unittest.TestCase):
     def base(self, **over):
-        m = {"schemaVersion": 1, "id": "x", "name": "X",
-             "sources": [{"format": "jsonl-lines", "glob": "~/**/*.jsonl"}]}
+        m = {
+            "schemaVersion": 1,
+            "id": "x",
+            "name": "X",
+            "sources": [{"format": "jsonl-lines", "glob": "~/**/*.jsonl"}],
+        }
         m.update(over)
         return m
 
@@ -647,14 +894,20 @@ class TestManifestValidation(unittest.TestCase):
     def test_problems_detected(self):
         self.assertTrue(ac.validate_manifest({"schemaVersion": 2}))
         bad = self.base(sources=[{"format": "nope"}])
-        self.assertTrue(any("unknown format" in p for p in ac.validate_manifest(bad)))
+        self.assertTrue(
+            any("unknown format" in p for p in ac.validate_manifest(bad))
+        )
         no_source = self.base(sources=[])
-        self.assertTrue(any("collect hook" in p for p in ac.validate_manifest(no_source)))
+        self.assertTrue(
+            any("collect hook" in p for p in ac.validate_manifest(no_source))
+        )
 
 
 class TestFilters(unittest.TestCase):
     def test_detect_missing_path_skips(self):
-        self.assertFalse(ac.detect_ok({"detect": [{"path": "/nonexistent/path/xyz"}]}))
+        self.assertFalse(
+            ac.detect_ok({"detect": [{"path": "/nonexistent/path/xyz"}]})
+        )
         self.assertTrue(ac.detect_ok({}))
 
     def test_superseded_uses_omarchy_bin(self):
