@@ -1149,14 +1149,20 @@ def save_state(state: dict) -> None:
 
 
 def lock_state():
-    """Take an exclusive advisory lock on the state file for this run.
+    """Take an exclusive advisory lock for this run.
 
     Serializes concurrent engine runs (service timer + manual CLI) so
-    cursors and counters are never lost or counted twice. The OS releases
-    the lock when the holder exits or crashes.
+    cursors and counters are never lost or counted twice. The lock lives
+    on a dedicated lock file next to the state file: save_state() replaces
+    the state pathname (new inode) on every save, so locking the state
+    file itself would let a third run lock the replacement inode while
+    this run still holds the old one. The lock file is never replaced or
+    deleted, so its inode stays stable. The OS releases the lock when the
+    holder exits or crashes.
     """
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    fd = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_path = STATE_FILE + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
     return fd
 

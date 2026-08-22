@@ -171,8 +171,9 @@ history size.
   The sqlite `>=` boundary and hook fingerprints bound the same issue for
   those sources.
 - Concurrent runs serialize: the engine holds an exclusive advisory lock on
-  the state file from load to save, so a manual CLI run cannot race the
-  service timer.
+  a dedicated lock file beside the state file from load to save, so a manual
+  CLI run cannot race the service timer. The lock file is never replaced,
+  which keeps the lock on a stable inode across state saves.
 
 ## Notes
 

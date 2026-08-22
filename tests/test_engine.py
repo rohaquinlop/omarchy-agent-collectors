@@ -1172,7 +1172,22 @@ class TestRunLock(unittest.TestCase):
         fd1 = ac.lock_state()
         try:
             with self.assertRaises(BlockingIOError):
-                fd2 = os.open(ac.STATE_FILE, os.O_RDWR)
+                fd2 = os.open(ac.STATE_FILE + ".lock", os.O_RDWR)
+                try:
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd2)
+        finally:
+            os.close(fd1)
+
+    def test_lock_survives_state_replacement(self):
+        # save_state() replaces the state pathname with a new inode; the
+        # lock must sit on a stable inode so a third run cannot slip in
+        fd1 = ac.lock_state()
+        try:
+            ac.save_state({"schemaVersion": 3})
+            with self.assertRaises(BlockingIOError):
+                fd2 = os.open(ac.STATE_FILE + ".lock", os.O_RDWR)
                 try:
                     fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 finally:
