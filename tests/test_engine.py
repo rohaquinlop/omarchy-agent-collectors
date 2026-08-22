@@ -13,7 +13,7 @@ from typing import ClassVar
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "bin"))
 
-import agent_collectors as ac  # symlink bin/agent_collectors.py -> agent-collectors
+import agent_collectors as ac  # engine lives in bin/agent_collectors.py; bin/agent-collectors is a launcher
 
 
 # Collectors are generators; tests consume them eagerly.
