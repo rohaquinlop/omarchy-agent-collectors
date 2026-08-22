@@ -2,14 +2,14 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Service side of roha.agent-collectors. Runs bin/agent-collectors once at
+// Service side of rohaquinlop.agent-collectors. Runs bin/agent-collectors once at
 // startup and then on an interval; the engine does the rest. The stock
 // omarchy.agents widget picks up whatever records land in the shared usage
 // directory, so no display code lives here.
 Item {
   id: root
 
-  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/roha.agent-collectors"
+  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/rohaquinlop.agent-collectors"
   readonly property string engine: pluginDir + "/bin/agent-collectors"
   readonly property int refreshIntervalSec: 900
 

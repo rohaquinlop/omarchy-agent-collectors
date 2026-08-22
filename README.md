@@ -21,7 +21,7 @@ agent (`h`/`l` to switch).
 To fully uninstall:
 
 ```bash
-omarchy plugin remove roha.agent-collectors
+omarchy plugin remove rohaquinlop.agent-collectors
 rm -f ~/.local/state/omarchy/agents/usage/pi.json \
       ~/.local/state/omarchy/agents/usage/opencode.json
 rm -rf ~/.cache/omarchy/agent-collectors
@@ -51,7 +51,7 @@ unchanged sources are not re-parsed. Delete it (or pass `--force`) for a full re
 ### CLI
 
 ```bash
-~/.config/omarchy/plugins/roha.agent-collectors/bin/agent-collectors --validate   # list adapters
+~/.config/omarchy/plugins/rohaquinlop.agent-collectors/bin/agent-collectors --validate   # list adapters
 ... --force                       # full rescan
 ... pi                            # only this adapter
 ... --except opencode             # everything but
