@@ -339,6 +339,43 @@ class TestJsonlCollector(unittest.TestCase):
         again = cj(self.source(), self.tmp, self.state, force=True)
         self.assertEqual(len(again), 1)
 
+    def test_oversized_line_skipped(self):
+        p = os.path.join(self.tmp, "sess1.jsonl")
+        with open(p, "w") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "timestamp": "2026-08-21T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "m",
+                            "usage": {},
+                        },
+                    }
+                )
+                + "\n"
+            )
+            fh.write("x" * (ac.JSONL_LINE_CAP + 100) + "\n")
+            fh.write(json.dumps(dict(self.PI_LINE, id="m2")) + "\n")
+        events = cj(self.source(), self.tmp, self.state, force=False)
+        self.assertEqual(len(events), 2)  # giant line skipped, cursor stays sane
+        # cursor advanced past the giant line: rerun yields nothing
+        self.assertEqual(cj(self.source(), self.tmp, self.state, force=False), [])
+
+    def test_file_count_capped(self):
+        for i in range(3):
+            self.write_session(
+                [dict(self.PI_LINE, id=f"m{i}")], name=f"s{i}.jsonl"
+            )
+        old = ac.JSONL_FILES_CAP
+        ac.JSONL_FILES_CAP = 2
+        try:
+            events = cj(self.source(), self.tmp, self.state, force=False)
+        finally:
+            ac.JSONL_FILES_CAP = old
+        self.assertEqual(len(events), 2)
+
 
 class TestSqliteCollector(unittest.TestCase):
     def setUp(self):
@@ -481,6 +518,37 @@ class TestSqliteCollector(unittest.TestCase):
         src["query"] = "DELETE FROM message"
         with self.assertRaises(RuntimeError):
             cs(src, self.tmp, {}, force=False)
+
+    def test_oversized_row_skipped(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO message VALUES (?,?,?,?)",
+            (
+                "big",
+                "s9",
+                1755770403000,
+                json.dumps(
+                    {"role": "x" * (ac.SQLITE_ROW_BYTES_CAP + 100)}
+                ),
+            ),
+        )
+        con.commit()
+        con.close()
+        events = cs(self.source(), self.tmp, {}, force=True)
+        self.assertEqual(len(events), 2)  # the giant-field row is skipped
+
+    def test_session_string_truncated(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO message VALUES (?,?,?,?)",
+            ("u9", "s" * 400, 1755770404000, json.dumps({"role": "user"})),
+        )
+        con.commit()
+        con.close()
+        events = cs(self.source(), self.tmp, {}, force=True)
+        big = [e for e in events if e["ts"] == 1755770404.0]
+        self.assertEqual(len(big), 1)
+        self.assertEqual(len(big[0]["session"]), ac.SQLITE_FIELD_CAP)
 
 
 class TestHookBounding(unittest.TestCase):

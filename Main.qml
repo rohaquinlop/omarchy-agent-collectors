@@ -18,21 +18,33 @@ Item {
     running: false
 
     readonly property int maxErrBytes: 1048576
-    property int errBytes: 0
 
-    // SplitParser streams stderr line by line; StdioCollector would buffer
-    // everything until process end. A hard byte cap detaches the parser so a
-    // pathological engine can never force unbounded allocation here.
+    // SplitParser with an empty splitMarker delivers raw read chunks;
+    // StdioCollector would buffer everything until process end, and a
+    // newline-splitting SplitParser would buffer one unbounded newline-free
+    // line before its onRead check could ever run. We split and cap in QML:
+    // the buffer is cut off and the parser detached as soon as it crosses
+    // the byte cap, whatever the line lengths.
     stderr: SplitParser {
       id: errParser
+      splitMarker: ""
+      property string buf: ""
+
       onRead: function(data) {
-        if (collectorProcess.errBytes > collectorProcess.maxErrBytes) {
+        if (collectorProcess.stderr === null) return
+        errParser.buf += data
+        if (errParser.buf.length > collectorProcess.maxErrBytes) {
           collectorProcess.stderr = null
           console.warn("agent-collectors", "stderr cap exceeded; detached")
           return
         }
-        collectorProcess.errBytes += data.length
-        if (data.trim() !== "") console.warn("agent-collectors", data.trim())
+        while (true) {
+          const idx = errParser.buf.indexOf("\n")
+          if (idx < 0) break
+          const line = errParser.buf.slice(0, idx)
+          errParser.buf = errParser.buf.slice(idx + 1)
+          if (line.trim() !== "") console.warn("agent-collectors", line.trim())
+        }
       }
     }
 
@@ -60,7 +72,7 @@ Item {
 
   function run() {
     if (collectorProcess.running) return
-    collectorProcess.errBytes = 0
+    errParser.buf = ""
     if (collectorProcess.stderr === null) collectorProcess.stderr = errParser
     collectorProcess.command = [root.engine]
     collectorProcess.running = true

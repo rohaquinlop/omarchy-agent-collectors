@@ -85,6 +85,10 @@ HOOK_FP_CAP: int = 50_000  # max hook event fingerprints kept per adapter
 BOUNDARY_FP_CAP: int = 10_000  # max boundary-timestamp fingerprints per sqlite source
 DETECT_TIMEOUT_S: int = 15  # detect command timeout
 PARTIAL_CAP = 8192  # max straddle-line tail bytes kept per jsonl file
+JSONL_FILES_CAP: int = 10_000  # max files matched per jsonl source per run
+JSONL_LINE_CAP: int = 1024 * 1024  # max bytes of a single jsonl line parsed
+SQLITE_ROW_BYTES_CAP: int = 1024 * 1024  # max bytes of string fields in a sqlite row
+SQLITE_FIELD_CAP: int = 256  # max chars retained for a session/model string
 HEAD_LEN = 64  # first bytes fingerprinted to detect file replacement
 
 
@@ -249,6 +253,24 @@ def jsonl_line_to_event(obj: dict, cfg: dict, path: str) -> dict | None:
     return None
 
 
+def iter_bounded_lines(fh, cap: int = JSONL_LINE_CAP):
+    """Yield lines up to cap bytes; oversized lines are drained and yield None.
+
+    Each readline call allocates at most cap + 1 bytes, so no physical line
+    can force unbounded allocation before parsing.
+    """
+    while True:
+        line = fh.readline(cap + 1)
+        if not line:
+            return
+        if not line.endswith("\n") and len(line) > cap:
+            while line and not line.endswith("\n"):
+                line = fh.readline(cap + 1)
+            yield None
+            continue
+        yield line
+
+
 def collect_jsonl_lines(
     source: dict, adapter_dir: str, state: dict, force: bool
 ):
@@ -262,7 +284,23 @@ def collect_jsonl_lines(
     straddle tail is re-attached to the first line of the new chunk. Events
     are yielded one at a time; nothing accumulates.
     """
-    files = sorted(set(globmod.glob(expand(source["glob"]), recursive=True)))
+    files: list[str] = []
+    seen: set[str] = set()
+    overflow = 0
+    for p in globmod.iglob(expand(source["glob"]), recursive=True):
+        if p in seen:
+            continue
+        seen.add(p)
+        if len(files) >= JSONL_FILES_CAP:
+            overflow += 1
+            continue
+        files.append(p)
+    if overflow:
+        log(
+            f"{source['glob']}: more than {JSONL_FILES_CAP} files matched;"
+            f" {overflow} extra skipped"
+        )
+    files.sort()
     cache_key = f"jsonl:{source['glob']}"
     cache = state.get(cache_key)
     if not isinstance(cache, dict):
@@ -309,10 +347,28 @@ def collect_jsonl_lines(
                             "offset", 0
                         ) > 0 and not cached.get("newline", True)
                 first = True
-                for line in fh:
+                for line in iter_bounded_lines(fh):
+                    if line is None:
+                        log(
+                            f"{path}: line exceeds {JSONL_LINE_CAP} bytes; skipped"
+                        )
+                        if first:
+                            partial = ""  # straddle tail belongs to that line
+                        continue
                     if first:
                         first = False
                         if partial:
+                            if len(partial) + len(line) > JSONL_LINE_CAP:
+                                log(
+                                    f"{path}: re-attached line exceeds"
+                                    f" {JSONL_LINE_CAP} bytes; skipped"
+                                )
+                                partial = ""
+                                while not line.endswith("\n"):
+                                    line = fh.readline(JSONL_LINE_CAP + 1)
+                                    if not line:
+                                        break
+                                continue
                             line = partial + line  # re-attach the straddle tail
                             partial = ""
                         elif (
@@ -419,13 +475,31 @@ def collect_sqlite_query(
                     f"sqlite {db_path}: query returned no columns"
                 )
             names = [d[0] for d in cur.description]
-            for row in cur:  # streamed; rows are never materialized
+            row_warned = False
+            for row in cur:  # streamed; the result set is never materialized
                 row = dict(zip(names, row))
+                if any(
+                    isinstance(v, str) and len(v) > SQLITE_ROW_BYTES_CAP
+                    for v in row.values()
+                ):
+                    if not row_warned:
+                        log(
+                            f"sqlite {db_path}: row exceeds"
+                            f" {SQLITE_ROW_BYTES_CAP} bytes; skipped"
+                        )
+                        row_warned = True
+                    continue
                 if ts_col:
                     raw = row.get(ts_col)
                     if raw is not None and (max_raw is None or raw > max_raw):
                         max_raw = raw
                 role = row.get(cols.get("role", ""))
+                sid = row.get(cols.get("sessionId", ""))
+                if isinstance(sid, str) and len(sid) > SQLITE_FIELD_CAP:
+                    sid = sid[:SQLITE_FIELD_CAP]
+                model = row.get(cols.get("model", ""))
+                if isinstance(model, str) and len(model) > SQLITE_FIELD_CAP:
+                    model = model[:SQLITE_FIELD_CAP]
                 kind = (
                     "prompt"
                     if role == source.get("promptRole", "user")
@@ -439,8 +513,8 @@ def collect_sqlite_query(
                     continue
                 ev = make_event(
                     row.get(cols.get("ts", "")),
-                    row.get(cols.get("sessionId", "")),
-                    row.get(cols.get("model", "")),
+                    sid,
+                    model,
                     kind,
                     row.get(cols.get("input", ""), 0)
                     if kind == "completion"

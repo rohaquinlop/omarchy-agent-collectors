@@ -126,11 +126,15 @@ history size.
   rescan when a file was replaced and regrown. A straddle line left by a
   crash-interrupted append is re-attached and parsed once. A mid-file rewrite
   that keeps the head and grows the file is not detected (JSONL session logs
-  are append-only in practice).
+  are append-only in practice). At most 10,000 files are matched per source
+  per run, and lines longer than 1 MiB are drained with bounded reads and
+  skipped (the stored straddle tail is capped at 8 KiB).
 - SQLite reads stream row by row; with a `ts` column only rows at or after the
   last seen timestamp are fetched, and rows sharing that boundary timestamp
   are deduplicated by fingerprint (adapter queries SHOULD `ORDER BY` the
-  timestamp column).
+  timestamp column). Rows whose string fields exceed 1 MiB in total are
+  skipped, and session/model strings are truncated at 256 characters before
+  they are retained in state.
 - Hook stdout is streamed and capped: 100,000 lines with 1 MiB of line
   buffering and a 16 MiB cumulative byte budget for `collect`, 1 MiB for
   `limits`; hook stderr is capped at 1 MiB. A hook
@@ -140,9 +144,9 @@ history size.
 - Hooks are stateless: they may re-emit their full history. The engine
   deduplicates hook events by fingerprint (50,000 per adapter); the same
   event is never counted twice.
-- The service streams engine stderr line by line with a 1 MiB cap instead of
-  buffering it to process end; the cap resets and the parser re-attaches on
-  every run.
+- The service streams engine stderr in raw chunks with a 1 MiB cap applied
+  per chunk (no line buffering, so a newline-free flood cannot bypass the
+  cap); the cap resets and the parser re-attaches on every run.
 - Session ids: the newest 10,000 are kept per adapter; beyond that
   `totalSessions` is the stored count plus the evicted count (approximate).
 - Model buckets: 50 per adapter; further models roll into `other`.
