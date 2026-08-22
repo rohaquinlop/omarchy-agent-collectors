@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "opencode",
+  "name": "OpenCode",
+  "description": "OpenCode session usage from ~/.local/share/opencode/opencode.db",
+  "detect": [{ "path": "~/.local/share/opencode/opencode.db" }],
+  "sources": [
+    {
+      "format": "sqlite-query",
+      "database": "~/.local/share/opencode/opencode.db",
+      "timestampUnit": "ms",
+      "promptRole": "user",
+      "completionRole": "assistant",
+      "query": "SELECT session_id, time_created, json_extract(data,'$.role') AS role, json_extract(data,'$.modelID') AS model, json_extract(data,'$.tokens.input') AS tin, json_extract(data,'$.tokens.output') AS tout, json_extract(data,'$.tokens.cache.read') AS tcr, json_extract(data,'$.tokens.cache.write') AS tcw FROM message ORDER BY time_created",
+      "columns": {
+        "ts": "time_created",
+        "sessionId": "session_id",
+        "role": "role",
+        "model": "model",
+        "input": "tin",
+        "output": "tout",
+        "cacheRead": "tcr",
+        "cacheWrite": "tcw"
+      }
+    }
+  ]
+}

@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""agent-collectors — usage records for AI coding agents, for Omarchy's agents panel.
+
+One engine, many adapters. Each adapter describes one agent's local session
+data; the engine normalizes it into canonical events, aggregates them, and
+writes one stock-contract JSON record per agent into
+~/.local/state/omarchy/agents/usage/ where the omarchy.agents panel watches.
+
+Usage:
+  agent-collectors [--force] [--except <id>] ... [<id> ...]
+  agent-collectors --validate [adapter-dir]
+
+Exit codes: 0 ok, 1 at least one adapter failed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob as globmod
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+
+# ---------------------------------------------------------------- paths
+
+HOME = os.path.expanduser("~")
+STATE_HOME = os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state"))
+CACHE_HOME = os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache"))
+USAGE_DIR = os.path.join(STATE_HOME, "omarchy", "agents", "usage")
+STATE_FILE = os.path.join(CACHE_HOME, "omarchy", "agent-collectors", "state.json")
+USER_ADAPTERS_DIR = os.path.join(HOME, ".config", "omarchy", "agent-collectors", "adapters")
+SHELL_JSON = os.path.join(HOME, ".config", "omarchy", "shell.json")
+OMARCHY_BIN = os.path.join(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"), "bin")
+BUILTIN_ADAPTERS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "adapters"))
+
+SCHEMA_VERSION = 1
+
+
+def log(msg: str) -> None:
+    print(f"agent-collectors: {msg}", file=sys.stderr)
+
+
+def expand(path: str) -> str:
+    return os.path.expanduser(path)
+
+
+# ---------------------------------------------------------------- helpers
+
+def get_path(obj, dotted):
+    """Follow a dot-separated path into nested dicts/lists; None when absent."""
+    cur = obj
+    for part in (dotted or "").split("."):
+        if not part:
+            continue
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.lstrip("-").isdigit():
+            idx = int(part)
+            cur = cur[idx] if -len(cur) <= idx < len(cur) else None
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def to_int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_ts(value, unit="s") -> float | None:
+    """Parse an ISO timestamp or an epoch number into epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        return ts / 1000.0 if unit == "ms" and ts > 1e11 else ts
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        ts = float(text)
+        return ts / 1000.0 if unit == "ms" and ts > 1e11 else ts
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def day_key(epoch_seconds: float) -> str:
+    return datetime.fromtimestamp(epoch_seconds).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------- events
+
+def make_event(ts, session, model, kind, inp=0, out=0, cread=0, cwrite=0, unit="s") -> dict | None:
+    ts = parse_ts(ts, unit)
+    if ts is None:
+        return None
+    return {
+        "ts": ts,
+        "session": str(session or ""),
+        "model": str(model or "unknown"),
+        "kind": kind,
+        "input": to_int(inp),
+        "output": to_int(out),
+        "cacheRead": to_int(cread),
+        "cacheWrite": to_int(cwrite),
+    }
+
+
+# ------------------------------------------------- jsonl-lines collector
+
+def collect_jsonl_lines(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
+    kind_path = source.get("kindPath", "")
+    kinds = set(source.get("kinds") or [])
+    role_path = source.get("rolePath", "")
+    prompt_role = source.get("promptRole", "user")
+    completion_role = source.get("completionRole", "assistant")
+    ts_path = source.get("timestampPath", "timestamp")
+    ts_unit = source.get("timestampUnit", "iso")
+    model_path = source.get("modelPath", "")
+    session_path = source.get("sessionIdPath", "")
+    tokens_map = source.get("tokens") or {}
+
+    files = sorted(set(globmod.glob(expand(source["glob"]), recursive=True)))
+    cache_key = f"jsonl:{source['glob']}"
+    cache = state.get(cache_key) if isinstance(state.get(cache_key), dict) else {}
+    new_cache = {}
+
+    events = []
+    for path in files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        sig = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        cached = cache.get(path)
+        if not force and isinstance(cached, dict) and cached.get("sig") == sig:
+            new_cache[path] = cached
+            events.extend(cached.get("events") or [])
+            continue
+
+        file_events = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if kinds and get_path(obj, kind_path) not in kinds:
+                        continue
+                    role = get_path(obj, role_path)
+                    sid = get_path(obj, session_path) if session_path else None
+                    if not sid:
+                        sid = os.path.splitext(path)[0]
+                    if role == prompt_role:
+                        ev = make_event(get_path(obj, ts_path), sid, None, "prompt")
+                    elif role == completion_role:
+                        t = tokens_map
+                        ev = make_event(
+                            get_path(obj, ts_path),
+                            sid,
+                            get_path(obj, model_path), "completion",
+                            get_path(obj, t.get("input", "")) if t.get("input") else 0,
+                            get_path(obj, t.get("output", "")) if t.get("output") else 0,
+                            get_path(obj, t.get("cacheRead", "")) if t.get("cacheRead") else 0,
+                            get_path(obj, t.get("cacheWrite", "")) if t.get("cacheWrite") else 0,
+                        )
+                    else:
+                        continue
+                    if ev:
+                        file_events.append(ev)
+        except OSError as e:
+            log(f"{path}: {e}")
+            # keep any previously cached summary for this file
+            if isinstance(cached, dict):
+                new_cache[path] = cached
+                events.extend(cached.get("events") or [])
+            continue
+        entry = {"sig": sig, "events": file_events}
+        new_cache[path] = entry
+        events.extend(file_events)
+
+    state[cache_key] = new_cache
+    return events
+
+
+# ---------------------------------------------- sqlite-query collector
+
+def collect_sqlite_query(source: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
+    db_path = expand(source["database"])
+    query = source["query"]
+    cols = source.get("columns") or {}
+    unit = source.get("timestampUnit", "s")
+
+    cache_key = f"sqlite:{source['database']}:{hashlib_key(query)}"
+    cached_summary = state.get(cache_key) if isinstance(state.get(cache_key), dict) else {}
+    if not force and cached_summary.get("sig") == db_sig(db_path):
+        return decode_cached_events(cached_summary)
+
+    uri = f"file:{db_path}?mode=ro"
+    events = []
+    try:
+        con = sqlite3.connect(uri, uri=True)
+        try:
+            cur = con.execute(query)
+            names = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                row = dict(zip(names, row))
+                role = row.get(cols.get("role", ""))
+                kind = "prompt" if role == source.get("promptRole", "user") else (
+                    "completion" if role == source.get("completionRole", "assistant") else None)
+                if kind is None:
+                    continue
+                ev = make_event(
+                    row.get(cols.get("ts", "")),
+                    row.get(cols.get("sessionId", "")),
+                    row.get(cols.get("model", "")), kind,
+                    row.get(cols.get("input", ""), 0) if kind == "completion" else 0,
+                    row.get(cols.get("output", ""), 0) if kind == "completion" else 0,
+                    row.get(cols.get("cacheRead", ""), 0) if kind == "completion" else 0,
+                    row.get(cols.get("cacheWrite", ""), 0) if kind == "completion" else 0,
+                    unit,
+                )
+                if ev:
+                    events.append(ev)
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        raise RuntimeError(f"sqlite {db_path}: {e}")
+
+    state[cache_key] = encode_cached_events(events, db_sig(db_path))
+    return events
+
+
+def db_sig(db_path: str):
+    try:
+        st = os.stat(db_path)
+    except OSError:
+        return None
+    sig = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    wal = db_path + "-wal"
+    if os.path.exists(wal):
+        ws = os.stat(wal)
+        sig["wal"] = [ws.st_size, ws.st_mtime_ns]
+    return sig
+
+
+def hashlib_key(text: str) -> str:
+    import hashlib
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
+
+
+# Caching full event lists in state would bloat; instead sqlite sources simply
+# rescan on signature change (cheap indexed queries) and skip on match by
+# reusing a stored compact digest of events.
+def encode_cached_events(events: list[dict], sig) -> dict:
+    return {"sig": sig, "events": events}
+
+
+def decode_cached_events(summary: dict) -> list[dict]:
+    return summary.get("events") or []
+
+
+# ------------------------------------------------------- hook collector
+
+def collect_hook(adapter: dict, adapter_dir: str, state: dict, force: bool) -> list[dict]:
+    script = adapter.get("collect")
+    if not script:
+        return []
+    result = subprocess.run(
+        [os.path.join(adapter_dir, script)], capture_output=True, text=True,
+        timeout=120, cwd=adapter_dir,
+        env={**os.environ, "FORCE": "1" if force else ""},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"collect hook failed: {result.stderr.strip()[:300]}")
+    events = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ev = make_event(obj.get("ts"), obj.get("session"), obj.get("model"),
+                        obj.get("kind"), obj.get("input"), obj.get("output"),
+                        obj.get("cacheRead"), obj.get("cacheWrite"))
+        if ev:
+            events.append(ev)
+    return events
+
+
+COLLECTORS = {
+    "jsonl-lines": collect_jsonl_lines,
+    "sqlite-query": collect_sqlite_query,
+}
+
+
+# ------------------------------------------------------------ aggregate
+
+def aggregate(events: list[dict], now: datetime | None = None) -> dict:
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+
+    recent_by_day = {d: 0 for d in days}
+    active_dates = set()
+    sessions_all = set()
+    sessions_today = set()
+    prompts_total = prompts_today = 0
+    sessions_today_count = 0
+    today_tokens = 0
+    tokens_by_model_today: dict[str, int] = {}
+    model_usage: dict[str, dict[str, int]] = {}
+
+    def bucket(model):
+        return model_usage.setdefault(model, {
+            "inputTokens": 0, "outputTokens": 0,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0})
+
+    for ev in events:
+        d = day_key(ev["ts"])
+        active_dates.add(d)
+        sid = ev["session"]
+        if sid:
+            sessions_all.add(sid)
+        tokens = ev["input"] + ev["output"] + ev["cacheRead"] + ev["cacheWrite"]
+        recent_by_day[d] = recent_by_day.get(d, 0) + tokens
+        if ev["kind"] == "prompt":
+            prompts_total += 1
+            if d == today:
+                prompts_today += 1
+        else:
+            m = bucket(ev["model"])
+            m["inputTokens"] += ev["input"]
+            m["outputTokens"] += ev["output"]
+            m["cacheReadInputTokens"] += ev["cacheRead"]
+            m["cacheCreationInputTokens"] += ev["cacheWrite"]
+            if d == today:
+                today_tokens += tokens
+                tokens_by_model_today[ev["model"]] = tokens_by_model_today.get(ev["model"], 0) + tokens
+        if d == today and sid:
+            if sid not in sessions_today:
+                sessions_today.add(sid)
+                sessions_today_count += 1
+
+    return {
+        "todayPrompts": prompts_today,
+        "todaySessions": sessions_today_count,
+        "todayTotalTokens": today_tokens,
+        "todayTokensByModel": tokens_by_model_today,
+        "recentDays": [{"date": d, "messageCount": recent_by_day[d]} for d in days],
+        "totalPrompts": prompts_total,
+        "totalSessions": len(sessions_all),
+        "activeDays": len(active_dates),
+        "activeDates": sorted(active_dates),
+        "modelUsage": model_usage,
+    }
+
+
+# -------------------------------------------------------------- records
+
+def build_record(adapter_id: str, name: str, events: list[dict], limits: list,
+                 status_text: str = "", auth_help: str = "", tier_label: str = "") -> dict:
+    record = {
+        "schemaVersion": SCHEMA_VERSION,
+        "id": adapter_id,
+        "name": name,
+        "updatedAt": datetime.now().astimezone().isoformat(),
+        "ready": True,
+        "hasLocalStats": True,
+        **aggregate(events),
+        "limits": limits or [],
+        "tierLabel": tier_label,
+        "usageStatusText": status_text,
+        "authHelpText": auth_help,
+    }
+    return record
+
+
+def write_record(record: dict, usage_dir: str) -> None:
+    os.makedirs(usage_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=usage_dir, prefix=f".{record['id']}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(record, fh, indent=2)
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(usage_dir, f"{record['id']}.json"))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ----------------------------------------------------------- discovery
+
+REQUIRED_SOURCE_KEYS = {"format"}
+
+
+def load_adapters(extra_dirs: list[str]) -> tuple[list[tuple[dict, str]], list[str]]:
+    """Return ([(manifest, dir)], warnings). User dirs override built-ins by id."""
+    found: dict[str, tuple[dict, str]] = {}
+    warnings: list[str] = []
+    search_dirs = []
+    for d in extra_dirs:
+        search_dirs.append(("builtin", d))
+    search_dirs.append(("builtin", BUILTIN_ADAPTERS_DIR))
+    search_dirs.append(("user", USER_ADAPTERS_DIR))
+
+    for origin, base in search_dirs:
+        if not os.path.isdir(base):
+            continue
+        for entry in sorted(os.listdir(base)):
+            manifest_path = os.path.join(base, entry, "manifest.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            try:
+                with open(manifest_path) as fh:
+                    m = json.load(fh)
+            except (json.JSONDecodeError, OSError) as e:
+                warnings.append(f"{origin} adapter {base}/{entry}: bad manifest ({e})")
+                continue
+            problems = validate_manifest(m)
+            if problems:
+                warnings.extend(f"{origin} adapter {entry}: {p}" for p in problems)
+                continue
+            found[m["id"]] = (m, os.path.join(base, entry))  # later dirs win
+    ordered = sorted(found.values(), key=lambda pair: pair[0]["id"])
+    return ordered, warnings
+
+
+def validate_manifest(m: dict) -> list[str]:
+    problems = []
+    if m.get("schemaVersion") != SCHEMA_VERSION:
+        problems.append(f"schemaVersion must be {SCHEMA_VERSION}")
+    if not m.get("id") or not str(m["id"]).replace("-", "").isalnum():
+        problems.append("missing/invalid id")
+    if not m.get("name"):
+        problems.append("missing name")
+    sources = m.get("sources")
+    hooks = m.get("hooks") or {}
+    collect_hook = (m.get("collect") or hooks.get("collect"))
+    if not sources and not collect_hook:
+        problems.append("needs sources[] or a collect hook")
+    for i, s in enumerate(sources or []):
+        missing = REQUIRED_SOURCE_KEYS - set(s)
+        if missing:
+            problems.append(f"sources[{i}] missing {sorted(missing)}")
+        elif s["format"] not in COLLECTORS:
+            problems.append(f"sources[{i}] unknown format {s['format']!r}")
+        elif s["format"] == "jsonl-lines" and not s.get("glob"):
+            problems.append(f"sources[{i}] jsonl-lines needs glob")
+        elif s["format"] == "sqlite-query" and not (s.get("database") and s.get("query")):
+            problems.append(f"sources[{i}] sqlite-query needs database+query")
+    return problems
+
+
+# ------------------------------------------------------------ filters
+
+def detect_ok(manifest: dict) -> bool:
+    checks = manifest.get("detect") or []
+    for check in checks:
+        path = expand(check.get("path", ""))
+        if check.get("type") == "command":
+            if subprocess.run(check["command"], shell=True).returncode != 0:
+                return False
+        elif not os.path.exists(path):
+            return False
+    return True
+
+
+def superseded(adapter_id: str) -> bool:
+    return os.path.isfile(os.path.join(OMARCHY_BIN, f"omarchy-agent-usage-{adapter_id}"))
+
+
+def provider_disabled(adapter_id: str) -> bool:
+    """True when omarchy.agents widget settings disable this provider."""
+    try:
+        with open(SHELL_JSON) as fh:
+            cfg = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    def scan(node):
+        if isinstance(node, dict):
+            if node.get("id") == "omarchy.agents":
+                providers = (node.get("providers") or {})
+                entry = providers.get(adapter_id)
+                return isinstance(entry, dict) and entry.get("enabled") is False
+            return any(scan(v) for v in node.values())
+        if isinstance(node, list):
+            return any(scan(v) for v in node)
+        return False
+
+    return scan(cfg)
+
+
+def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> list:
+    script = manifest.get("limits")
+    if not script:
+        return []
+    try:
+        result = subprocess.run([os.path.join(adapter_dir, script)],
+                                capture_output=True, text=True, timeout=30, cwd=adapter_dir)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"{manifest['id']} limits hook: {e}")
+        return []
+    if result.returncode != 0:  # optional by contract: exit 1 == no data
+        return []
+    try:
+        data = json.loads(result.stdout)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+# ---------------------------------------------------------------- main
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE), prefix=".state.")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="agent-collectors")
+    parser.add_argument("--force", action="store_true", help="rescan all sources, ignore caches")
+    parser.add_argument("--except", dest="except_ids", action="append", default=[])
+    parser.add_argument("--usage-dir", default=USAGE_DIR)
+    parser.add_argument("--adapters-dir", action="append", default=[],
+                        help="extra adapters directory (repeatable)")
+    parser.add_argument("--validate", action="store_true", help="list discovered adapters and exit")
+    parser.add_argument("ids", nargs="*", help="only these adapter ids")
+    args = parser.parse_args(argv)
+
+    adapters, warnings = load_adapters(args.adapters_dir)
+    for w in warnings:
+        log(w)
+
+    if args.validate:
+        for m, d in adapters:
+            print(f"{m['id']:20} {m['name']:20} {d}" + ("  [SUPERSEDED]" if superseded(m["id"]) else ""))
+        return 0
+
+    wanted = set(args.ids)
+    excluded = set(args.except_ids)
+    state = {} if args.force else load_state()
+
+    status = 0
+    ran_any = False
+    for manifest, adapter_dir in adapters:
+        aid = manifest["id"]
+        if wanted and aid not in wanted:
+            continue
+        if aid in excluded:
+            continue
+        if superseded(aid):
+            log(f"{aid}: skipped, official omarchy-agent-usage-{aid} exists")
+            continue
+        if provider_disabled(aid):
+            log(f"{aid}: skipped, disabled in shell.json")
+            continue
+        if not detect_ok(manifest):
+            continue
+        ran_any = True
+        try:
+            events = []
+            for source in manifest.get("sources") or []:
+                fn = COLLECTORS[source["format"]]
+                events.extend(fn(source, adapter_dir, state, args.force))
+            hook = manifest.get("collect")
+            if hook:
+                events.extend(collect_hook({**manifest, "collect": hook}, adapter_dir, state, args.force))
+            record = build_record(aid, manifest["name"], events,
+                                  run_limits_hook(manifest, adapter_dir, args.force),
+                                  status_text=manifest.get("usageStatusText", ""),
+                                  auth_help=manifest.get("authHelpText", ""),
+                                  tier_label=manifest.get("tierLabel", ""))
+            write_record(record, args.usage_dir)
+            print(f"{aid}: {len(events)} events -> {aid}.json")
+        except Exception as e:  # isolation: one adapter never blocks others
+            log(f"{aid}: FAILED {e}")
+            status = 1
+
+    if ran_any or state:
+        save_state(state)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

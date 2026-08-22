@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "roha.agent-collectors",
+  "name": "Agent collectors",
+  "version": "0.1.0",
+  "author": "rohaquinlop",
+  "license": "MIT",
+  "description": "Extensible usage collectors for AI coding agents (Pi, OpenCode, and community adapters). Writes records the stock omarchy.agents panel displays.",
+  "kinds": ["service"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "service": "Main.qml"
+  },
+  "service": {
+    "description": "Runs agent usage collectors on an interval and writes records into ~/.local/state/omarchy/agents/usage/."
+  }
+}

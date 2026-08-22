@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "pi",
+  "name": "Pi",
+  "description": "Pi coding agent session usage from ~/.pi/agent/sessions",
+  "detect": [{ "path": "~/.pi/agent/sessions" }],
+  "sources": [
+    {
+      "format": "jsonl-lines",
+      "glob": "~/.pi/agent/sessions/**/*.jsonl",
+      "kindPath": "type",
+      "kinds": ["message"],
+      "rolePath": "message.role",
+      "promptRole": "user",
+      "completionRole": "assistant",
+      "timestampPath": "timestamp",
+      "modelPath": "message.model",
+      "tokens": {
+        "input": "message.usage.input",
+        "output": "message.usage.output",
+        "cacheRead": "message.usage.cacheRead",
+        "cacheWrite": "message.usage.cacheWrite"
+      }
+    }
+  ]
+}
