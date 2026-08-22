@@ -3,7 +3,7 @@
 Extensible usage collectors for AI coding agents on [Omarchy](https://omarchy.org).
 
 <p align="center">
-  <img src="preview.png" alt="The omarchy.agents panel showing Claude, OpenCode, and Pi tabs" width="360">
+  <img src="preview.png" alt="The omarchy.agents panel showing Claude, OpenCode, and Pi tabs" width="320">
 </p>
 
 One engine, many drop-in adapters. Writes stock-contract records into
