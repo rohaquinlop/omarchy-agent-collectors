@@ -2,7 +2,10 @@
 
 Extensible usage collectors for AI coding agents on [Omarchy](https://omarchy.org).
 
-![The omarchy.agents panel showing Claude, OpenCode, and Pi tabs](preview.png)
+<p align="center">
+  <img src="preview.png" alt="The omarchy.agents panel showing Claude, OpenCode, and Pi tabs" width="360">
+</p>
+
 One engine, many drop-in adapters. Writes stock-contract records into
 `~/.local/state/omarchy/agents/usage/`, where Omarchy's built-in
 `omarchy.agents` bar panel picks them up automatically — no UI code involved.
