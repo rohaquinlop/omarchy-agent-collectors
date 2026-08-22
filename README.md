@@ -16,7 +16,16 @@ omarchy plugin add https://github.com/rohaquinlop/omarchy-agent-collectors.git -
 
 The service runs the engine at shell start and every 15 minutes. Records for
 every detected agent appear within seconds; the Agents panel grows a chip per
-agent (`h`/`l` to switch). Remove with `omarchy plugin remove roha.agent-collectors`.
+agent (`h`/`l` to switch).
+
+To fully uninstall:
+
+```bash
+omarchy plugin remove roha.agent-collectors
+rm -f ~/.local/state/omarchy/agents/usage/pi.json \
+      ~/.local/state/omarchy/agents/usage/opencode.json
+rm -rf ~/.cache/omarchy/agent-collectors
+```
 
 ## How it works
 
