@@ -70,7 +70,9 @@ engine stops writing its record and the panel drops the tab.
 
 ## Writing an adapter
 
-Create `~/.config/omarchy/agent-collectors/adapters/<id>/manifest.json`:
+Create `~/.config/omarchy/agent-collectors/adapters/<id>/manifest.json`: no plugin code
+is ever touched — the engine discovers adapters from this directory on every
+run. A user adapter with the same `id` as a built-in one overrides it.
 
 ```json
 {
