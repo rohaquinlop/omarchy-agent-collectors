@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -13,6 +14,8 @@ from typing import ClassVar
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "bin"))
+
+import fcntl
 
 import agent_collectors as ac  # engine lives in bin/agent_collectors.py; bin/agent-collectors is a launcher
 
@@ -134,6 +137,22 @@ class TestAccumulator(unittest.TestCase):
         self.assertEqual(stats["sessionsEvicted"], 500)
         rec = ac.build_record("x", "X", stats, [])
         self.assertEqual(rec["totalSessions"], n)
+
+    def test_days_map_stays_in_window(self):
+        now = datetime(2026, 8, 21, 18, 0, 0, tzinfo=timezone.utc)
+        stats = ac.fresh_stats()
+        ac.merge_events(
+            stats,
+            [
+                ev("2020-01-01T10:00:00Z", "old", "m"),  # before the window
+                ev("2030-01-01T10:00:00Z", "future", "m"),  # after today
+                ev("2026-08-21T10:00:00Z", "now", "m"),  # today
+            ],
+            now=now,
+        )
+        self.assertEqual(stats["days"], {"2026-08-21": 18})
+        rec = ac.build_record("x", "X", stats, [], now=now)
+        self.assertEqual(rec["totalSessions"], 3)  # counters still count
 
     def test_model_cap_routes_to_other(self):
         stats = ac.fresh_stats()
@@ -339,6 +358,38 @@ class TestJsonlCollector(unittest.TestCase):
         again = cj(self.source(), self.tmp, self.state, force=True)
         self.assertEqual(len(again), 1)
 
+    def test_giant_session_id_truncated(self):
+        src = self.source()
+        src["sessionIdPath"] = "message.sessionId"
+        self.write_session(
+            [
+                {
+                    "type": "message",
+                    "timestamp": "2026-08-21T10:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "m",
+                        "sessionId": "s" * 500,
+                        "usage": {},
+                    },
+                }
+            ]
+        )
+        events = cj(src, self.tmp, self.state, force=False)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events[0]["session"]), ac.EVENT_FIELD_CAP)
+
+    def test_deeply_nested_line_skipped_not_fatal(self):
+        self.write_session(
+            [self.PI_LINE]
+            + [dict(self.PI_LINE, id="m2")]
+        )
+        with open(os.path.join(self.tmp, "sess1.jsonl"), "a") as fh:
+            fh.write("[" * 100000 + "]" * 100000 + "\n")  # RecursionError
+        events = cj(self.source(), self.tmp, self.state, force=False)
+        self.assertEqual(len(events), 2)  # both valid lines parsed; junk skipped
+        self.assertEqual(cj(self.source(), self.tmp, self.state, force=False), [])
+
     def test_oversized_line_skipped(self):
         p = os.path.join(self.tmp, "sess1.jsonl")
         with open(p, "w") as fh:
@@ -370,11 +421,26 @@ class TestJsonlCollector(unittest.TestCase):
             )
         old = ac.JSONL_FILES_CAP
         ac.JSONL_FILES_CAP = 2
-        try:
-            events = cj(self.source(), self.tmp, self.state, force=False)
-        finally:
-            ac.JSONL_FILES_CAP = old
+        import builtins
+        from unittest import mock
+
+        real_open = builtins.open
+        with mock.patch("builtins.open") as mo, mock.patch.object(
+            ac, "log"
+        ) as ml:
+            mo.side_effect = real_open
+            try:
+                events = cj(self.source(), self.tmp, self.state, force=False)
+            finally:
+                ac.JSONL_FILES_CAP = old
+        opened = [c.args[0] for c in mo.call_args_list]
+        logged = [str(c.args[0]) for c in ml.call_args_list]
         self.assertEqual(len(events), 2)
+        # the glob scan stopped at the cap: exactly 2 files were ever opened
+        self.assertEqual(
+            len({p for p in opened if p.endswith(".jsonl")}), 2
+        )
+        self.assertTrue(any("capped at" in m for m in logged))
 
 
 class TestSqliteCollector(unittest.TestCase):
@@ -548,7 +614,7 @@ class TestSqliteCollector(unittest.TestCase):
         events = cs(self.source(), self.tmp, {}, force=True)
         big = [e for e in events if e["ts"] == 1755770404.0]
         self.assertEqual(len(big), 1)
-        self.assertEqual(len(big[0]["session"]), ac.SQLITE_FIELD_CAP)
+        self.assertEqual(len(big[0]["session"]), ac.EVENT_FIELD_CAP)
 
 
 class TestHookBounding(unittest.TestCase):
@@ -676,6 +742,35 @@ class TestHookBounding(unittest.TestCase):
         )
         self.assertEqual(len(events), 1)
         self.assertLess(time.monotonic() - t0, 10)
+
+    def test_hook_giant_session_truncated(self):
+        with open(self.script, "w") as fh:
+            fh.write("#!/bin/sh\n")
+            fh.write(
+                'echo \'{"ts": "2026-08-21T10:00:00Z", "session": "'
+                + "s" * 500
+                + '", "kind": "completion"}\'\n'
+            )
+        events = ch(
+            {"id": "x", "collect": "collect.sh"}, self.tmp, force=False
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events[0]["session"]), ac.EVENT_FIELD_CAP)
+
+    def test_hook_deeply_nested_line_skipped(self):
+        with open(self.script, "w") as fh:
+            fh.write("#!/bin/sh\n")
+            fh.write(
+                'echo \'{"ts": "2026-08-21T10:00:00Z", "session": "s", "kind": "completion"}\'\n'
+            )
+            fh.write("python3 -c \"print('['*100000 + ']'*100000)\"\n")
+            fh.write(
+                'echo \'{"ts": "2026-08-21T10:00:01Z", "session": "s", "kind": "completion"}\'\n'
+            )
+        events = ch(
+            {"id": "x", "collect": "collect.sh"}, self.tmp, force=False
+        )
+        self.assertEqual(len(events), 2)
 
 
 class TestHookDedupe(unittest.TestCase):
@@ -987,6 +1082,27 @@ class TestManifestValidation(unittest.TestCase):
     def test_valid_manifest_passes(self):
         self.assertEqual(ac.validate_manifest(self.base()), [])
 
+    def test_oversized_manifest_skipped(self):
+        old_builtin = ac.BUILTIN_ADAPTERS_DIR
+        old_user = ac.USER_ADAPTERS_DIR
+        ac.BUILTIN_ADAPTERS_DIR = "/nonexistent/adapters"
+        ac.USER_ADAPTERS_DIR = "/nonexistent/user-adapters"
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                ad = os.path.join(d, "adapters", "big")
+                os.makedirs(ad)
+                with open(os.path.join(ad, "manifest.json"), "w") as fh:
+                    fh.seek(ac.MANIFEST_CAP + 1)
+                    fh.write("{}")
+                adapters, warnings = ac.load_adapters(
+                    [os.path.join(d, "adapters")]
+                )
+        finally:
+            ac.BUILTIN_ADAPTERS_DIR = old_builtin
+            ac.USER_ADAPTERS_DIR = old_user
+        self.assertEqual(adapters, [])
+        self.assertTrue(any("exceeds" in w for w in warnings))
+
     def test_problems_detected(self):
         self.assertTrue(ac.validate_manifest({"schemaVersion": 2}))
         bad = self.base(sources=[{"format": "nope"}])
@@ -1028,6 +1144,111 @@ class TestFilters(unittest.TestCase):
                 self.assertTrue(ac.superseded("pi"))
         finally:
             ac.OMARCHY_BIN = old
+
+    def test_oversized_shell_json_treated_as_enabled(self):
+        old = ac.SHELL_JSON
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, "shell.json")
+                ac.SHELL_JSON = p
+                with open(p, "w") as fh:
+                    fh.seek(ac.SHELL_JSON_GUARD + 1)
+                    fh.write("{}")
+                self.assertFalse(ac.provider_disabled("pi"))
+        finally:
+            ac.SHELL_JSON = old
+
+
+class TestRunLock(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_state = ac.STATE_FILE
+        ac.STATE_FILE = os.path.join(self.tmp, "state.json")
+
+    def tearDown(self):
+        ac.STATE_FILE = self.old_state
+
+    def test_lock_is_exclusive(self):
+        fd1 = ac.lock_state()
+        try:
+            with self.assertRaises(BlockingIOError):
+                fd2 = os.open(ac.STATE_FILE, os.O_RDWR)
+                try:
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd2)
+        finally:
+            os.close(fd1)
+
+    def test_concurrent_runs_serialize(self):
+        ad = os.path.join(self.tmp, "adapters", "ok")
+        os.makedirs(ad)
+        manifest = {
+            "schemaVersion": 1,
+            "id": "ok",
+            "name": "OK",
+            "sources": [
+                {
+                    "format": "jsonl-lines",
+                    "glob": os.path.join(self.tmp, "*.jsonl"),
+                    "kindPath": "type",
+                    "kinds": ["message"],
+                    "rolePath": "message.role",
+                    "promptRole": "user",
+                    "completionRole": "assistant",
+                    "timestampPath": "timestamp",
+                    "modelPath": "message.model",
+                    "tokens": {
+                        "input": "message.usage.input",
+                        "output": "message.usage.output",
+                        "cacheRead": "message.usage.cacheRead",
+                        "cacheWrite": "message.usage.cacheWrite",
+                    },
+                }
+            ],
+        }
+        with open(os.path.join(ad, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh)
+        with open(os.path.join(self.tmp, "sess.jsonl"), "w") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "timestamp": "2026-08-21T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "m",
+                            "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                        },
+                    }
+                )
+                + "\n"
+            )
+        usage = os.path.join(self.tmp, "usage")
+        os.makedirs(usage)
+        args = [
+            "--adapters-dir",
+            os.path.join(self.tmp, "adapters"),
+            "--usage-dir",
+            usage,
+        ]
+        threads = [
+            threading.Thread(target=ac.main, args=(args,)) for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with open(ac.STATE_FILE) as fh:
+            state = json.load(fh)
+        # serialized: the second run saw the committed cursor and merged nothing
+        self.assertEqual(
+            state["stats"]["ok"]["modelUsage"]["m"]["inputTokens"], 1
+        )
+        self.assertEqual(
+            state["stats"]["ok"]["sessions"],
+            [os.path.join(self.tmp, "sess")],
+        )
 
 
 if __name__ == "__main__":

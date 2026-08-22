@@ -18,13 +18,14 @@ Item {
     running: false
 
     readonly property int maxErrBytes: 1048576
+    property int errBytes: 0
 
     // SplitParser with an empty splitMarker delivers raw read chunks;
     // StdioCollector would buffer everything until process end, and a
     // newline-splitting SplitParser would buffer one unbounded newline-free
     // line before its onRead check could ever run. We split and cap in QML:
-    // the buffer is cut off and the parser detached as soon as it crosses
-    // the byte cap, whatever the line lengths.
+    // the parser detaches on the total bytes per run OR on the pending
+    // buffer, whichever crosses the cap first.
     stderr: SplitParser {
       id: errParser
       splitMarker: ""
@@ -32,8 +33,10 @@ Item {
 
       onRead: function(data) {
         if (collectorProcess.stderr === null) return
+        collectorProcess.errBytes += data.length
         errParser.buf += data
-        if (errParser.buf.length > collectorProcess.maxErrBytes) {
+        if (collectorProcess.errBytes > collectorProcess.maxErrBytes ||
+            errParser.buf.length > collectorProcess.maxErrBytes) {
           collectorProcess.stderr = null
           console.warn("agent-collectors", "stderr cap exceeded; detached")
           return
@@ -72,6 +75,7 @@ Item {
 
   function run() {
     if (collectorProcess.running) return
+    collectorProcess.errBytes = 0
     errParser.buf = ""
     if (collectorProcess.stderr === null) collectorProcess.stderr = errParser
     collectorProcess.command = [root.engine]

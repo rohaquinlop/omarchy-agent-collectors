@@ -24,6 +24,7 @@ import argparse
 import base64
 import bisect
 import copy
+import fcntl
 import glob as globmod
 import hashlib
 import json
@@ -88,7 +89,9 @@ PARTIAL_CAP = 8192  # max straddle-line tail bytes kept per jsonl file
 JSONL_FILES_CAP: int = 10_000  # max files matched per jsonl source per run
 JSONL_LINE_CAP: int = 1024 * 1024  # max bytes of a single jsonl line parsed
 SQLITE_ROW_BYTES_CAP: int = 1024 * 1024  # max bytes of string fields in a sqlite row
-SQLITE_FIELD_CAP: int = 256  # max chars retained for a session/model string
+EVENT_FIELD_CAP: int = 256  # max chars retained for a session/model string
+MANIFEST_CAP: int = 1024 * 1024  # max bytes of an adapter manifest.json
+SHELL_JSON_GUARD: int = 64 * 1024 * 1024  # shell.json larger than this is ignored
 HEAD_LEN = 64  # first bytes fingerprinted to detect file replacement
 
 
@@ -159,8 +162,8 @@ def make_event(
         return None
     return {
         "ts": ts,
-        "session": str(session or ""),
-        "model": str(model or "unknown"),
+        "session": str(session or "")[:EVENT_FIELD_CAP],
+        "model": str(model or "unknown")[:EVENT_FIELD_CAP],
         "kind": kind,
         "input": to_int(inp),
         "output": to_int(out),
@@ -286,19 +289,19 @@ def collect_jsonl_lines(
     """
     files: list[str] = []
     seen: set[str] = set()
-    overflow = 0
+    capped = False
     for p in globmod.iglob(expand(source["glob"]), recursive=True):
         if p in seen:
             continue
         seen.add(p)
         if len(files) >= JSONL_FILES_CAP:
-            overflow += 1
-            continue
+            capped = True
+            break
         files.append(p)
-    if overflow:
+    if capped:
         log(
-            f"{source['glob']}: more than {JSONL_FILES_CAP} files matched;"
-            f" {overflow} extra skipped"
+            f"{source['glob']}: capped at {JSONL_FILES_CAP} files;"
+            " remaining matches skipped"
         )
     files.sort()
     cache_key = f"jsonl:{source['glob']}"
@@ -380,7 +383,7 @@ def collect_jsonl_lines(
                         continue
                     try:
                         obj = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, RecursionError):
                         continue
                     ev = jsonl_line_to_event(obj, cfg, path)
                     if ev:
@@ -495,11 +498,7 @@ def collect_sqlite_query(
                         max_raw = raw
                 role = row.get(cols.get("role", ""))
                 sid = row.get(cols.get("sessionId", ""))
-                if isinstance(sid, str) and len(sid) > SQLITE_FIELD_CAP:
-                    sid = sid[:SQLITE_FIELD_CAP]
                 model = row.get(cols.get("model", ""))
-                if isinstance(model, str) and len(model) > SQLITE_FIELD_CAP:
-                    model = model[:SQLITE_FIELD_CAP]
                 kind = (
                     "prompt"
                     if role == source.get("promptRole", "user")
@@ -720,7 +719,7 @@ def collect_hook(adapter: dict, adapter_dir: str, force: bool):
     for line in output:
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         ev = make_event(
             obj.get("ts"),
@@ -817,7 +816,9 @@ def merge_events(stats: dict, events, now: datetime | None = None) -> int:
             }
         )
     cutoff = (now - timedelta(days=DAY_WINDOW - 1)).strftime("%Y-%m-%d")
-    stats["days"] = {d: v for d, v in stats["days"].items() if d >= cutoff}
+    stats["days"] = {
+        d: v for d, v in stats["days"].items() if cutoff <= d <= today
+    }
 
     sessions = stats["sessions"]
     sessions_seen = set(sessions)
@@ -841,7 +842,8 @@ def merge_events(stats: dict, events, now: datetime | None = None) -> int:
             if len(active_dates) > ACTIVE_DATES_CAP:
                 active_dates.pop(0)
                 stats["activeDatesEvicted"] += 1
-        stats["days"][d] = stats["days"].get(d, 0) + tokens
+        if cutoff <= d <= today:
+            stats["days"][d] = stats["days"].get(d, 0) + tokens
         if ev["kind"] == "prompt":
             stats["promptsTotal"] += 1
             if d == today:
@@ -963,6 +965,15 @@ def load_adapters(
             if not os.path.isfile(manifest_path):
                 continue
             try:
+                if os.path.getsize(manifest_path) > MANIFEST_CAP:
+                    warnings.append(
+                        f"{origin} adapter {base}/{entry}: manifest exceeds"
+                        f" {MANIFEST_CAP} bytes; skipped"
+                    )
+                    continue
+            except OSError:
+                continue
+            try:
                 with open(manifest_path) as fh:
                     m = json.load(fh)
             except (json.JSONDecodeError, OSError) as e:
@@ -1043,6 +1054,9 @@ def superseded(adapter_id: str) -> bool:
 def provider_disabled(adapter_id: str) -> bool:
     """True when omarchy.agents widget settings disable this provider."""
     try:
+        if os.path.getsize(SHELL_JSON) > SHELL_JSON_GUARD:
+            log(f"shell.json exceeds {SHELL_JSON_GUARD} bytes; ignored")
+            return False
         with open(SHELL_JSON) as fh:
             cfg = json.load(fh)
     except (OSError, json.JSONDecodeError):
@@ -1089,7 +1103,7 @@ def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> list:
     try:
         data = json.loads(output)
         return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         return []
 
 
@@ -1134,6 +1148,19 @@ def save_state(state: dict) -> None:
         raise
 
 
+def lock_state():
+    """Take an exclusive advisory lock on the state file for this run.
+
+    Serializes concurrent engine runs (service timer + manual CLI) so
+    cursors and counters are never lost or counted twice. The OS releases
+    the lock when the holder exits or crashes.
+    """
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    fd = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="agent-collectors")
     parser.add_argument(
@@ -1157,11 +1184,10 @@ def main(argv=None) -> int:
     parser.add_argument("ids", nargs="*", help="only these adapter ids")
     args = parser.parse_args(argv)
 
-    adapters, warnings = load_adapters(args.adapters_dir)
-    for w in warnings:
-        log(w)
-
     if args.validate:
+        adapters, warnings = load_adapters(args.adapters_dir)
+        for w in warnings:
+            log(w)
         for m, d in adapters:
             print(
                 f"{m['id']:20} {m['name']:20} {d}"
@@ -1171,6 +1197,17 @@ def main(argv=None) -> int:
 
     wanted = set(args.ids)
     excluded = set(args.except_ids)
+    lock_fd = lock_state()
+    try:
+        return _run(wanted, excluded, args)
+    finally:
+        os.close(lock_fd)
+
+
+def _run(wanted: set, excluded: set, args) -> int:
+    adapters, warnings = load_adapters(args.adapters_dir)
+    for w in warnings:
+        log(w)
     state = load_state()
 
     status = 0

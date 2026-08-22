@@ -126,15 +126,18 @@ history size.
   rescan when a file was replaced and regrown. A straddle line left by a
   crash-interrupted append is re-attached and parsed once. A mid-file rewrite
   that keeps the head and grows the file is not detected (JSONL session logs
-  are append-only in practice). At most 10,000 files are matched per source
-  per run, and lines longer than 1 MiB are drained with bounded reads and
-  skipped (the stored straddle tail is capped at 8 KiB).
+  are append-only in practice). The scan stops at 10,000 matched files per
+  source per run (the glob is not walked further), and lines longer than
+  1 MiB are drained with bounded reads and skipped (the stored straddle
+  tail is capped at 8 KiB).
 - SQLite reads stream row by row; with a `ts` column only rows at or after the
   last seen timestamp are fetched, and rows sharing that boundary timestamp
   are deduplicated by fingerprint (adapter queries SHOULD `ORDER BY` the
   timestamp column). Rows whose string fields exceed 1 MiB in total are
   skipped, and session/model strings are truncated at 256 characters before
-  they are retained in state.
+  they are retained in state. The same 256-character truncation applies to
+  session and model strings from jsonl lines and hook output (in
+  `make_event`, before anything reaches state).
 - Hook stdout is streamed and capped: 100,000 lines with 1 MiB of line
   buffering and a 16 MiB cumulative byte budget for `collect`, 1 MiB for
   `limits`; hook stderr is capped at 1 MiB. A hook
@@ -145,10 +148,17 @@ history size.
   deduplicates hook events by fingerprint (50,000 per adapter); the same
   event is never counted twice.
 - The service streams engine stderr in raw chunks with a 1 MiB cap applied
-  per chunk (no line buffering, so a newline-free flood cannot bypass the
-  cap); the cap resets and the parser re-attaches on every run.
+  to the run total and to the pending buffer (no line buffering, so neither
+  a flood of short lines nor one newline-free line bypasses the cap); the
+  caps reset and the parser re-attaches on every run.
 - Session ids: the newest 10,000 are kept per adapter; beyond that
   `totalSessions` is the stored count plus the evicted count (approximate).
+  Session and model strings never exceed 256 characters.
+- Per-day token counters stay inside the rolling window: events dated
+  before the window or after today update session/model/date counters but
+  add no day entries.
+- Adapter manifests larger than 1 MiB are skipped with a warning; a
+  shell.json larger than 64 MiB is treated as having no disabled providers.
 - Model buckets: 50 per adapter; further models roll into `other`.
 - Active dates: 730 days are kept; older ones still count toward `activeDays`.
 - A state file larger than 64 MiB is ignored and rebuilt by a one-time full
@@ -160,6 +170,9 @@ history size.
   between can double-count that adapter's appended bytes on the next run.
   The sqlite `>=` boundary and hook fingerprints bound the same issue for
   those sources.
+- Concurrent runs serialize: the engine holds an exclusive advisory lock on
+  the state file from load to save, so a manual CLI run cannot race the
+  service timer.
 
 ## Notes
 
