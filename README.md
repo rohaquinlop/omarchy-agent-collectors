@@ -105,6 +105,23 @@ is skipped with a warning; it can never take other agents down.
   marks land upstream.
 - Tests: `python3 -m unittest discover -s tests`.
 
+## Token fields
+
+Canonical events and the panel's per-model hover carry four token counters:
+
+| Field | Meaning | Billing |
+|---|---|---|
+| `input` / `output` | Prompt tokens sent and completion tokens generated on this request | Standard rates |
+| `cacheRead` | Prompt tokens served from the provider's server-side context cache instead of being re-processed | Discounted (~10% of input rate on Anthropic-style APIs) |
+| `cacheWrite` | New prompt tokens written into that cache so later requests can read them | Premium (~125% of input rate on Anthropic-style APIs) |
+
+Typical pattern: the first turn of a session writes most of the context to the
+cache; follow-up turns read it back and only write each turn's new tail.
+
+Providers without a billed prompt cache (MiMo, DeepSeek, and other OpenCode zen
+models at the moment) report `cacheWrite: 0`, so a zero there means "not
+offered by this model", not "nothing happened".
+
 ## License
 
 MIT
