@@ -10,8 +10,10 @@ One engine, many drop-in adapters. Writes stock-contract records into
 `~/.local/state/omarchy/agents/usage/`, where Omarchy's built-in
 `omarchy.agents` bar panel picks them up automatically — no UI code involved.
 
-Out of the box: **Pi** (`~/.pi/agent/sessions`) and **OpenCode**
-(`~/.local/share/opencode/opencode.db`). Anything else is one manifest away.
+Out of the box: **Pi** (`~/.pi/agent/sessions`), **OpenCode**
+(`~/.local/share/opencode/opencode.db`), **Ollama Cloud**
+(`ollama.com/api/usage`) and **SuperGrok** (the Grok CLI's billing proxy).
+Anything else is one manifest away.
 
 ## Install
 
@@ -176,6 +178,33 @@ history size.
   a dedicated lock file beside the state file from load to save, so a manual
   CLI run cannot race the service timer. The lock file is never replaced,
   which keeps the lock on a stable inode across state saves.
+
+## Built-in adapters
+
+| Adapter | Limits | Local stats |
+|---|---|---|
+| `pi` | — | Pi session records |
+| `opencode` | — | the opencode SQLite database |
+| `ollama` | `GET ollama.com/api/usage` with an API key — session (5h) and weekly (7d) fractions, per-model request counts, and a **learned** reset countdown (a sample per run; a drop to ~0 marks a boundary, boundary + period predicts the next, withdrawn when the cadence cannot be confirmed) or one **stated** by the user from the ollama.com dashboard (`limits.sh --seed session=3h weekly=3d`) | ollama-served models in the Pi and opencode logs |
+| `grok` | `cli-chat-proxy.grok.com/v1/billing?format=credits` with the Grok CLI's OIDC session, including the per-product rows | the Grok CLI's own `turn_completed` usage, plus grok attribution in the Pi and opencode logs |
+
+Two things worth knowing about the Ollama adapter, because they are deliberate:
+
+- **No browser scraping.** Reading the signed-in settings page (what the
+  community plugins do) needs a Chromium profile carrying an ollama.com
+  session; the API and an API key give the same meters without it. There is no
+  balance in that API and no reset timestamp in it — hence the learned/seed
+  countdown above and the documented absence of a balance row.
+- **Reset countdowns never guess.** A countdown the adapter derives is marked
+  on the limit row (`resetsEstimated` for "approximately at", `resetsProvisional`
+  for "no later than"); the stock panel ignores unknown keys, so the record
+  stays valid either way.
+
+Both adapters bound their own output, because two engine limits fail silently:
+stdout is killed at 100k lines / 16 MB and fingerprints are evicted oldest-first
+past 50k, after which a re-emitted event looks new and is counted twice. The
+hooks emit a bounded history (14 days, self-capped at 40k lines / 12 MB) and
+report what they kept on stderr.
 
 ## Notes
 

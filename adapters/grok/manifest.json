@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "grok",
+  "name": "Grok",
+  "tierLabel": "SuperGrok",
+  "detect": [
+    {
+      "type": "command",
+      "command": "test -f \"${GROK_HOME:-$HOME/.grok}/auth.json\""
+    }
+  ],
+  "collect": "collect.sh",
+  "limits": "limits.sh"
+}

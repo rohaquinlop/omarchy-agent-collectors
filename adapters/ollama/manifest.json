@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "ollama",
+  "name": "Ollama",
+  "tierLabel": "Max",
+  "detect": [
+    {
+      "type": "command",
+      "command": "if [ -n \"$OLLAMA_API_KEY\" ]; then exit 0; fi; files=\"${OLLAMA_USAGE_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/agents/ollama.env:${XDG_CONFIG_HOME:-$HOME/.config}/agent-secrets/.env}\"; oldifs=$IFS; IFS=:; for candidate in $files; do IFS=$oldifs; grep -qs \"^OLLAMA_API_KEY=\" \"$candidate\" && exit 0; IFS=:; done; IFS=$oldifs; exit 1"
+    }
+  ],
+  "collect": "collect.sh",
+  "limits": "limits.sh"
+}
