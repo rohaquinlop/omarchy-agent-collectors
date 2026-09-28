@@ -29,6 +29,7 @@ import glob as globmod
 import hashlib
 import json
 import os
+import re
 import selectors
 import signal
 import sqlite3
@@ -100,7 +101,13 @@ def log(msg: str) -> None:
 
 
 def expand(path: str) -> str:
-    return os.path.expanduser(path)
+    # Manifest paths may supply a default for unset or empty environment variables.
+    path = re.sub(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}",
+        lambda m: os.environ.get(m.group(1)) or m.group(2),
+        path,
+    )
+    return os.path.expanduser(os.path.expandvars(path))
 
 
 # ---------------------------------------------------------------- helpers

@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "id": "pi",
   "name": "Pi",
-  "description": "Pi coding agent session usage from ~/.pi/agent/sessions",
-  "detect": [{ "path": "~/.pi/agent/sessions" }],
+  "description": "Pi coding agent session usage from PI_CODING_AGENT_DIR (or ~/.pi/agent)",
+  "detect": [{ "path": "${PI_CODING_AGENT_DIR:-~/.pi/agent}/sessions" }],
   "sources": [
     {
       "format": "jsonl-lines",
-      "glob": "~/.pi/agent/sessions/**/*.jsonl",
+      "glob": "${PI_CODING_AGENT_DIR:-~/.pi/agent}/sessions/**/*.jsonl",
       "kindPath": "type",
       "kinds": ["message"],
       "rolePath": "message.role",
