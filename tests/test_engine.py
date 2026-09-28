@@ -11,6 +11,7 @@ import types
 import unittest
 from datetime import datetime, timezone
 from typing import ClassVar
+from unittest.mock import patch
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "bin"))
@@ -1066,6 +1067,60 @@ class TestStreaming(unittest.TestCase):
         merged = ac.merge_events(ac.fresh_stats(), gen)
         self.assertEqual(merged, 100)
         self.assertEqual(cs(src, tmp, state, force=False), [])
+
+
+class TestAdapterPaths(unittest.TestCase):
+    def manifest(self, agent):
+        with open(os.path.join(REPO, "adapters", agent, "manifest.json")) as fh:
+            return json.load(fh)
+
+    def test_pi_uses_configured_root_for_detection_and_sessions(self):
+        manifest = self.manifest("pi")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "pi")
+            sessions = os.path.join(root, "sessions")
+            os.makedirs(sessions)
+            log = os.path.join(sessions, "example.jsonl")
+            with open(log, "w") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "timestamp": "2026-08-21T10:00:00Z",
+                            "message": {"role": "user"},
+                        }
+                    ) + "\n"
+                )
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": root}):
+                self.assertTrue(ac.detect_ok(manifest))
+                self.assertEqual(
+                    len(cj(manifest["sources"][0], tmp, {}, True)), 1
+                )
+
+    def test_unset_or_empty_variables_keep_default_paths(self):
+        for overrides in ({}, {"PI_CODING_AGENT_DIR": "", "XDG_DATA_HOME": ""}):
+            with patch.dict(os.environ, overrides, clear=True):
+                for agent, expected in (
+                    ("pi", "~/.pi/agent/sessions"),
+                    ("opencode", "~/.local/share/opencode/opencode.db"),
+                ):
+                    manifest = self.manifest(agent)
+                    self.assertEqual(
+                        ac.expand(manifest["detect"][0]["path"]),
+                        os.path.expanduser(expected),
+                    )
+
+    def test_opencode_uses_xdg_data_home(self):
+        manifest = self.manifest("opencode")
+        with patch.dict(os.environ, {"XDG_DATA_HOME": "/tmp/xdg-data"}):
+            self.assertEqual(
+                ac.expand(manifest["detect"][0]["path"]),
+                "/tmp/xdg-data/opencode/opencode.db",
+            )
+            self.assertEqual(
+                ac.expand(manifest["sources"][0]["database"]),
+                "/tmp/xdg-data/opencode/opencode.db",
+            )
 
 
 class TestManifestValidation(unittest.TestCase):

@@ -10,8 +10,9 @@ One engine, many drop-in adapters. Writes stock-contract records into
 `~/.local/state/omarchy/agents/usage/`, where Omarchy's built-in
 `omarchy.agents` bar panel picks them up automatically — no UI code involved.
 
-Out of the box: **Pi** (`~/.pi/agent/sessions`) and **OpenCode**
-(`~/.local/share/opencode/opencode.db`). Anything else is one manifest away.
+Out of the box: **Pi** (`$PI_CODING_AGENT_DIR/sessions`, falling back to
+`~/.pi/agent/sessions`) and **OpenCode** (`$XDG_DATA_HOME/opencode/opencode.db`,
+falling back to `~/.local/share/opencode/opencode.db`). Anything else is one manifest away.
 
 ## Install
 
@@ -97,6 +98,9 @@ run. A user adapter with the same `id` as a built-in one overrides it.
 - Prompts are events whose role matches `promptRole`; completions match
   `completionRole` and carry tokens.
 - `sessionIdPath` optional — defaults to the file stem (one session per file).
+- Paths in `detect.path`, `sources[].glob`, and `sources[].database` expand `~`,
+  environment variables, and `${NAME:-fallback}` (fallback for unset or empty values).
+  Expansion does not run a shell.
 
 For anything the field map can't express, ship executables next to the
 manifest and reference them:

@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "id": "opencode",
   "name": "OpenCode",
-  "description": "OpenCode session usage from ~/.local/share/opencode/opencode.db",
-  "detect": [{ "path": "~/.local/share/opencode/opencode.db" }],
+  "description": "OpenCode session usage from XDG_DATA_HOME (or ~/.local/share)",
+  "detect": [{ "path": "${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db" }],
   "sources": [
     {
       "format": "sqlite-query",
-      "database": "~/.local/share/opencode/opencode.db",
+      "database": "${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db",
       "timestampUnit": "ms",
       "promptRole": "user",
       "completionRole": "assistant",
