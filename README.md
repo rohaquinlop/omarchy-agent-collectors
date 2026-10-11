@@ -180,11 +180,44 @@ history size.
 ## Notes
 
 - Rate-limit meters only appear for adapters with a working `limits` hook;
-  Pi has no usage endpoint, so its tab shows local stats only.
+  Pi has no usage endpoint, so its tab shows local stats only. OpenCode
+  shows OpenCode Go meters (below).
 - The stock panel resolves provider icons from its own read-only assets
   directory; unknown agents render the standard bar glyph unless/until
   marks land upstream.
 - Tests: `python3 -m unittest discover -s tests`.
+
+## OpenCode Go limits
+
+The OpenCode adapter's `limits.py` adds **Go 5-hour / weekly / monthly**
+meters for anyone with OpenCode Go usage in `opencode.db`, computed locally
+(the console's numbers need a browser session cookie, so they are not used):
+
+- Go gives each model a monthly dollar limit; the 5-hour and weekly
+  allowances are 20% and 50% of it. A request uses cost ÷ that model's limit.
+  Limits and prices live in `adapters/opencode/go-models.json`, copied from
+  [opencode.ai/docs/go](https://opencode.ai/docs/go/); update it when Go's
+  table changes.
+- Cost is re-priced from tokens: `opencode.db` always records a model's base
+  tier, but long-context requests (GPT 6 Luna over 272K, Grok over 200K, …)
+  and DeepSeek peak hours bill higher. 
+  
+Optional `~/.config/omarchy/agent-collectors/opencode.json`:
+
+```json
+{
+  "go": { "plan": "go", "renewsAt": "2026-10-31T14:26:00Z" },
+  "zen": { "monthlyBudget": 40 }
+}
+```
+
+- `go.renewsAt` — the console's "Renews …" time; without it the month is
+  anchored to your first Go request and the meter reads "Go monthly · est.".
+- `go.plan` — `"go-plus"` uses Go Plus limits.
+- `zen.monthlyBudget` — adds a **Zen budget** meter: recorded Zen spend this
+  calendar month (UTC) against the workspace budget from the console's
+  Controls page. It reads slightly low; OpenCode's title-generation calls
+  are billed but not stored locally.
 
 ## Token fields
 

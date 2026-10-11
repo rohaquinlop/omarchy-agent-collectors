@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "opencode",
   "name": "OpenCode",
-  "description": "OpenCode session usage from ~/.local/share/opencode/opencode.db",
+  "description": "OpenCode session usage from ~/.local/share/opencode/opencode.db, plus OpenCode Go limits (and an optional Zen budget) from limits.py",
   "detect": [{ "path": "~/.local/share/opencode/opencode.db" }],
   "sources": [
     {
@@ -23,5 +23,6 @@
         "cacheWrite": "tcw"
       }
     }
-  ]
+  ],
+  "limits": "limits.py"
 }
