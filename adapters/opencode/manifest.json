@@ -11,7 +11,8 @@
       "timestampUnit": "ms",
       "promptRole": "user",
       "completionRole": "assistant",
-      "query": "SELECT session_id, time_created, json_extract(data,'$.role') AS role, json_extract(data,'$.modelID') AS model, json_extract(data,'$.tokens.input') AS tin, json_extract(data,'$.tokens.output') AS tout, json_extract(data,'$.tokens.cache.read') AS tcr, json_extract(data,'$.tokens.cache.write') AS tcw FROM message ORDER BY time_created",
+      "query": "SELECT session_id, time_created, type AS role, json_extract(data,'$.model.id') AS model, json_extract(data,'$.tokens.input') AS tin, json_extract(data,'$.tokens.output') AS tout, json_extract(data,'$.tokens.cache.read') AS tcr, json_extract(data,'$.tokens.cache.write') AS tcw FROM session_message WHERE type IN ('user','assistant') ORDER BY time_created",
+      "fallbackQuery": "SELECT session_id, time_created, json_extract(data,'$.role') AS role, json_extract(data,'$.modelID') AS model, json_extract(data,'$.tokens.input') AS tin, json_extract(data,'$.tokens.output') AS tout, json_extract(data,'$.tokens.cache.read') AS tcr, json_extract(data,'$.tokens.cache.write') AS tcw FROM message WHERE json_extract(data,'$.role') IN ('user','assistant') ORDER BY time_created",
       "columns": {
         "ts": "time_created",
         "sessionId": "session_id",

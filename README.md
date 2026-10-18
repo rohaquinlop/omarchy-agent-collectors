@@ -52,6 +52,9 @@ Per run the engine:
 
 State (per-file parse caches) lives in `~/.cache/omarchy/agent-collectors/state.json`;
 unchanged sources are not re-parsed. Delete it (or pass `--force`) for a full rescan.
+An adapter whose query or glob changed starts a new cursor, so run once with
+`--force` after such an edit: it rebuilds the affected records from source
+instead of merging a re-scan into the previous totals.
 
 ### CLI
 
@@ -93,6 +96,11 @@ run. A user adapter with the same `id` as a built-in one overrides it.
 
 - Formats: `jsonl-lines` (glob + per-line field map) or `sqlite-query`
   (read-only database + query + column map; `timestampUnit: "ms"` if needed).
+  A `sqlite-query` source may add an optional `fallbackQuery`, tried only when
+  the primary query fails to prepare — an agent that moved its data to a new
+  table, say. Both queries must emit the same columns; the adapter then spans
+  the schema change instead of breaking on one side of it. Retrying is safe
+  because a failed prepare has yielded no rows.
 - Dot paths index nested JSON (`message.usage.input`).
 - Prompts are events whose role matches `promptRole`; completions match
   `completionRole` and carry tokens.

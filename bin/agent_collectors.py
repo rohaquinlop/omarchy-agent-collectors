@@ -439,13 +439,24 @@ def collect_sqlite_query(
     (adapter queries SHOULD ORDER BY the timestamp column). Without a ts
     column a full streaming rescan runs on every signature change. Rows are
     yielded one at a time; nothing accumulates.
+
+    A source may carry a `fallbackQuery`, tried when the primary query fails
+    to prepare — an agent that moved its data to a new table, for instance.
+    Both queries must emit the same columns, so one adapter spans a schema
+    change instead of breaking on one side of it. Retrying is safe: execute()
+    prepares before returning, so a failed prepare has yielded no rows.
     """
     db_path = expand(source["database"])
-    query = source["query"]
     cols = source.get("columns") or {}
     unit = source.get("timestampUnit", "s")
+    queries = [
+        q for q in (source["query"], source.get("fallbackQuery")) if q
+    ]
 
-    cache_key = f"sqlite:{source['database']}:{hashlib_key(query)}"
+    cache_key = (
+        f"sqlite:{source['database']}:"
+        f"{hashlib_key(chr(0).join(queries))}"
+    )
     cached = state.get(cache_key)
     if not isinstance(cached, dict):
         cached = {}
@@ -460,11 +471,14 @@ def collect_sqlite_query(
         else None
     )
     boundary_fps = set(cached.get("boundary") or []) if not force else set()
-    run_query, params = query, ()
-    if ts_col and last_ts is not None:
-        quoted = ts_col.replace('"', '""')
-        run_query = f'SELECT * FROM ({query}) WHERE "{quoted}" >= ?'
-        params = (last_ts,)
+
+    def bounded(query):
+        if ts_col and last_ts is not None:
+            quoted = ts_col.replace('"', '""')
+            return f'SELECT * FROM ({query}) WHERE "{quoted}" >= ?', (
+                last_ts,
+            )
+        return query, ()
 
     max_raw = last_ts
     new_boundary: list[str] = []
@@ -472,8 +486,20 @@ def collect_sqlite_query(
     try:
         con = sqlite3.connect(uri, uri=True)
         try:
-            cur = con.execute(run_query, params)
-            if cur.description is None:
+            cur = None
+            for index, query in enumerate(queries):
+                run_query, params = bounded(query)
+                try:
+                    cur = con.execute(run_query, params)
+                    break
+                except sqlite3.Error as e:
+                    if index == len(queries) - 1:
+                        raise
+                    log(
+                        f"sqlite {db_path}: query failed ({e});"
+                        " trying fallback"
+                    )
+            if cur is None or cur.description is None:
                 raise RuntimeError(
                     f"sqlite {db_path}: query returned no columns"
                 )

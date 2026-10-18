@@ -585,6 +585,38 @@ class TestSqliteCollector(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cs(src, self.tmp, {}, force=False)
 
+    def test_fallback_query_used_when_primary_missing(self):
+        src = self.source()
+        fallback = src["query"]
+        src["query"] = (
+            "SELECT session_id, time_created, type AS role,"
+            " json_extract(data,'$.model.id') AS model,"
+            " json_extract(data,'$.tokens.input') AS tin,"
+            " json_extract(data,'$.tokens.output') AS tout,"
+            " json_extract(data,'$.tokens.cache.read') AS tcr,"
+            " json_extract(data,'$.tokens.cache.write') AS tcw"
+            " FROM session_message ORDER BY time_created"
+        )
+        src["fallbackQuery"] = fallback
+        events = cs(src, self.tmp, {}, force=False)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(
+            sorted(e["kind"] for e in events), ["completion", "prompt"]
+        )
+
+    def test_primary_query_wins_when_table_exists(self):
+        # A failing fallback must never be reached while the primary prepares.
+        src = self.source()
+        src["fallbackQuery"] = "SELECT * FROM missing_table"
+        events = cs(src, self.tmp, {}, force=False)
+        self.assertEqual(len(events), 2)
+
+    def test_missing_table_without_fallback_raises(self):
+        src = self.source()
+        src["query"] = "SELECT * FROM missing_table"
+        with self.assertRaises(RuntimeError):
+            cs(src, self.tmp, {}, force=False)
+
     def test_oversized_row_skipped(self):
         con = sqlite3.connect(self.db)
         con.execute(
