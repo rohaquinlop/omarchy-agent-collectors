@@ -198,9 +198,8 @@ class TestRecordContract(unittest.TestCase):
         self.assertEqual(missing, set())
 
     def test_matches_live_records_when_present(self):
-        """Key sets must be a superset of the stock collectors' live output."""
+        """Check known contract keys; newer collectors may add optional fields."""
         usage_dir = os.path.expanduser("~/.local/state/omarchy/agents/usage")
-        rec = ac.build_record("x", "X", ac.fresh_stats(), [])
         for name in ("claude.json", "codex.json"):
             path = os.path.join(usage_dir, name)
             if not os.path.exists(path):
@@ -208,8 +207,8 @@ class TestRecordContract(unittest.TestCase):
             with open(path) as fh:
                 live = json.load(fh)
             self.assertFalse(
-                set(live) - set(rec),
-                f"record missing live keys: {set(live) - set(rec)}",
+                self.CONTRACT_KEYS - set(live),
+                f"live record missing contract keys: {self.CONTRACT_KEYS - set(live)}",
             )
 
 
@@ -1246,6 +1245,7 @@ class TestRunLock(unittest.TestCase):
             os.path.join(self.tmp, "adapters"),
             "--usage-dir",
             usage,
+            "ok",  # Do not run real installed adapters in the concurrency test.
         ]
         threads = [
             threading.Thread(target=ac.main, args=(args,)) for _ in range(2)
@@ -1254,6 +1254,7 @@ class TestRunLock(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
+        self.assertEqual(os.listdir(usage), ["ok.json"])
         with open(ac.STATE_FILE) as fh:
             state = json.load(fh)
         # serialized: the second run saw the committed cursor and merged nothing

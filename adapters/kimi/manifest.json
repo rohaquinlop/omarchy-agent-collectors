@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "kimi",
+  "name": "Kimi Code",
+  "detect": [
+    {
+      "type": "command",
+      "command": "test -f \"${KIMI_CODE_HOME:-$HOME/.kimi-code}/credentials/kimi-code.json\""
+    }
+  ],
+  "limits": "limits.py"
+}
