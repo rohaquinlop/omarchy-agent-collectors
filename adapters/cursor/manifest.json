@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "cursor",
+  "name": "Cursor",
+  "detect": [
+    {
+      "type": "command",
+      "command": "test -f \"${XDG_CONFIG_HOME:-$HOME/.config}/cursor/auth.json\""
+    }
+  ],
+  "limits": "limits.py"
+}

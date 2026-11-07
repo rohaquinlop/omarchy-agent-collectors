@@ -1246,6 +1246,7 @@ class TestRunLock(unittest.TestCase):
             os.path.join(self.tmp, "adapters"),
             "--usage-dir",
             usage,
+            "ok",  # Do not run real installed adapters in the concurrency test.
         ]
         threads = [
             threading.Thread(target=ac.main, args=(args,)) for _ in range(2)
@@ -1254,6 +1255,7 @@ class TestRunLock(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
+        self.assertEqual(os.listdir(usage), ["ok.json"])
         with open(ac.STATE_FILE) as fh:
             state = json.load(fh)
         # serialized: the second run saw the committed cursor and merged nothing
