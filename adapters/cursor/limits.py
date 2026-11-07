@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read personal Cursor subscription quotas using official CLI credentials."""
 
+import http.client
 import json
 import math
 import os
@@ -138,11 +139,11 @@ def collect() -> dict:
         if error.code == 429:
             return unavailable("Cursor checks rate limited", "Wait for the next scheduled refresh.")
         return unavailable("Cursor usage unavailable", f"Cursor returned HTTP {error.code}; try again later.")
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
         return unavailable("Cursor usage unavailable", "Could not read Cursor usage; check the connection and retry later.")
     try:
         plan = request_json("GetPlanInfo", token)
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
         # A plan lookup is optional; never invent a quota reset from a billing date.
         plan = {}
     return parse_usage(usage, plan)

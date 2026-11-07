@@ -1,6 +1,7 @@
 """Offline tests for Cursor's subscription quota adapter (no real credentials)."""
 
 import importlib.util
+import http.client
 import io
 import json
 import os
@@ -92,6 +93,17 @@ class TestCollect(CursorTest):
         self.assertEqual(before, (self.auth.read_bytes(), self.auth.stat().st_mtime_ns))
         self.assertEqual(request.call_args_list[0].args, ("GetCurrentPeriodUsage", "synthetic-secret"))
         self.assertEqual(request.call_count, 2)
+
+    def test_truncated_http_response_is_handled_for_usage_and_plan(self):
+        with patch.object(self.cursor, "request_json", side_effect=http.client.IncompleteRead(b"partial")):
+            result = self.cursor.collect()
+        self.assertEqual(result["limits"], [])
+        self.assertTrue(result["usageStatusText"])
+        with patch.object(self.cursor, "request_json", side_effect=[
+            {"planUsage": {"totalPercentUsed": 10}}, http.client.IncompleteRead(b"partial"),
+        ]):
+            result = self.cursor.collect()
+        self.assertEqual(result["limits"], [{"label": "Subscription", "percent": 0.1}])
 
     def test_cli_emits_actionable_diagnostic_without_traceback(self):
         import subprocess

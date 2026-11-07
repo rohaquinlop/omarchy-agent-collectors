@@ -65,6 +65,11 @@ unchanged sources are not re-parsed. Delete it (or pass `--force`) for a full re
 
 ## Cursor subscription limits
 
+This adapter is for older Omarchy installations without a built-in Cursor
+collector. Omarchy 4.5 already includes native Cursor support and icons; prefer
+that when available. The engine automatically skips this adapter when
+`omarchy-agent-usage-cursor` is present, so it does not duplicate the system collector.
+
 Sign into the official Cursor Agent with `cursor-agent login`. The adapter reads
 `~/.config/cursor/auth.json` (or `$XDG_CONFIG_HOME/cursor/auth.json`) and requests
 account quotas directly; Pi, a Cursor SDK extension, API keys, browser cookies,
