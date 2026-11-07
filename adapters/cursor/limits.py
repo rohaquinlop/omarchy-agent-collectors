@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
 import urllib.error
@@ -148,4 +149,7 @@ def collect() -> dict:
 
 
 if __name__ == "__main__":
-    print(json.dumps(collect(), allow_nan=False))
+    result = collect()
+    if not result["limits"]:
+        print(f"Cursor: {result['usageStatusText']}. {result['authHelpText']}", file=sys.stderr)
+    print(json.dumps(result, allow_nan=False))

@@ -10,8 +10,9 @@ One engine, many drop-in adapters. Writes stock-contract records into
 `~/.local/state/omarchy/agents/usage/`, where Omarchy's built-in
 `omarchy.agents` bar panel picks them up automatically — no UI code involved.
 
-Out of the box: **Pi** (`~/.pi/agent/sessions`) and **OpenCode**
-(`~/.local/share/opencode/opencode.db`). Anything else is one manifest away.
+Out of the box: **Pi** (`~/.pi/agent/sessions`), **OpenCode**
+(`~/.local/share/opencode/opencode.db`), and **Cursor** personal subscription
+limits (official CLI credentials). Anything else is one manifest away.
 
 ## Install
 
@@ -60,6 +61,36 @@ unchanged sources are not re-parsed. Delete it (or pass `--force`) for a full re
 ... --force                       # full rescan
 ... pi                            # only this adapter
 ... --except opencode             # everything but
+```
+
+## Cursor subscription limits
+
+Sign into the official Cursor Agent with `cursor-agent login`. The adapter reads
+`~/.config/cursor/auth.json` (or `$XDG_CONFIG_HOME/cursor/auth.json`) and requests
+account quotas directly; Pi, a Cursor SDK extension, API keys, browser cookies,
+and model prompts are not required. These are client-facing endpoints used by
+the official CLI, not a guaranteed stable third-party API.
+
+The Cursor tab shows the subscription percentage and the included-usage reset
+time when the service supplies it. It does not assume a monthly period or need
+absolute spend values. No local token history is collected, so token charts
+are omitted. Currently only personal subscriptions are supported: a team selected
+in the CLI configuration is rejected rather than silently showing personal usage.
+
+Credentials are **read-only**: the adapter never refreshes, rotates, or rewrites
+them. When they expire or are revoked, sign in again through the official CLI.
+Network/auth errors do not become a 0%-used quota; without valid limits the stock
+panel may hide the tab. Inspect the hook directly for a safe diagnostic:
+
+```bash
+~/.config/omarchy/plugins/rohaquinlop.agent-collectors/adapters/cursor/limits.py
+```
+
+Updates use the service's existing startup/15-minute schedule. The stock panel's
+refresh button runs Omarchy's own collectors, not this plugin. To update now:
+
+```bash
+~/.config/omarchy/plugins/rohaquinlop.agent-collectors/bin/agent-collectors cursor
 ```
 
 ## Widget settings honored

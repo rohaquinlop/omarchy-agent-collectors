@@ -93,6 +93,17 @@ class TestCollect(CursorTest):
         self.assertEqual(request.call_args_list[0].args, ("GetCurrentPeriodUsage", "synthetic-secret"))
         self.assertEqual(request.call_count, 2)
 
+    def test_cli_emits_actionable_diagnostic_without_traceback(self):
+        import subprocess
+        self.auth.unlink()
+        result = subprocess.run(
+            [os.sys.executable, str(ADAPTER / "limits.py")],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout)["limits"], [])
+        self.assertIn("cursor-agent login", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_default_config_path(self):
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}), patch.object(Path, "home", return_value=Path(self.temp.name)):
             self.assertEqual(self.cursor.config_dir(), Path(self.temp.name) / ".config" / "cursor")
