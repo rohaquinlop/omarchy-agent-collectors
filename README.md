@@ -10,8 +10,9 @@ One engine, many drop-in adapters. Writes stock-contract records into
 `~/.local/state/omarchy/agents/usage/`, where Omarchy's built-in
 `omarchy.agents` bar panel picks them up automatically — no UI code involved.
 
-Out of the box: **Pi** (`~/.pi/agent/sessions`) and **OpenCode**
-(`~/.local/share/opencode/opencode.db`). Anything else is one manifest away.
+Out of the box: **Pi** (`~/.pi/agent/sessions`), **OpenCode**
+(`~/.local/share/opencode/opencode.db`), and **Kimi Code** subscription limits
+(official CLI credentials). Anything else is one manifest away.
 
 ## Install
 
@@ -62,6 +63,44 @@ unchanged sources are not re-parsed. Delete it (or pass `--force`) for a full re
 ... --except opencode             # everything but
 ```
 
+## Kimi Code subscription limits
+
+This adapter is for older Omarchy installations without a built-in Kimi
+collector. Omarchy 4.5 already includes native Kimi support and icons; prefer
+that when available. The engine automatically skips this adapter when
+`omarchy-agent-usage-kimi` is present, so it does not duplicate the system collector.
+
+Sign in with the current official Kimi Code CLI (`kimi login`). The adapter reads
+`~/.kimi-code/credentials/kimi-code.json`, `region`, and the optional `device_id`.
+`KIMI_CODE_HOME` overrides that home directory. It does not read Pi credentials
+or require the CLI binary on the service's PATH. Legacy `~/.kimi` credentials
+are not supported by this adapter.
+
+Only the client's explicit `mainland-cn` and `global` regions are accepted, each
+with its own fixed HTTPS usage endpoint. The mainland-China endpoint was tested
+with an authenticated account; the global endpoint has offline tests only.
+Client-facing APIs may change without a third-party compatibility guarantee.
+
+Meters follow the windows the server actually returns: session, weekly, monthly
+total, and monthly Code allocation. The two monthly rows are separate allowances,
+not values to add together. No local-token history, balance, or custom icons are
+collected/installed. Credentials are **read-only**; re-login through the official
+CLI when they expire. No model prompts, API key, or browser cookies are required.
+
+The service keeps its existing startup/15-minute schedule. The stock panel's
+refresh button does not invoke this plugin; refresh manually with:
+
+```bash
+~/.config/omarchy/plugins/rohaquinlop.agent-collectors/bin/agent-collectors kimi
+```
+
+Auth/network errors do not become successful 0%-used readings. Without valid
+limits the stock panel may hide the tab. For a safe diagnostic run the hook:
+
+```bash
+~/.config/omarchy/plugins/rohaquinlop.agent-collectors/adapters/kimi/limits.py
+```
+
 ## Widget settings honored
 
 If you disable a provider in the Agents widget settings
@@ -107,6 +146,11 @@ manifest and reference them:
 
 - `collect` prints one canonical-event JSON object per line on stdout.
 - `limits` prints a limits-array JSON on stdout; exit 1 means "no data", not failure.
+  It may instead print an object with a `limits` array and optional string fields
+  `tierLabel`, `usageStatusText`, and `authHelpText`. These override the manifest's
+  defaults for that run; other fields cannot overwrite the record.
+- An adapter may contain only a `limits` hook, without `sources` or `collect`.
+  Such records mark local/prompt statistics unavailable and omit token-day charts.
 - Both run with the adapter directory as cwd; `FORCE=1` is set on forced runs.
 
 Validate your setup with `bin/agent-collectors --validate`. A broken adapter

@@ -890,6 +890,7 @@ def build_record(
     auth_help: str = "",
     tier_label: str = "",
     now: datetime | None = None,
+    has_local_stats: bool = True,
 ) -> dict:
     today = stats["today"]
     now = now or datetime.now(timezone.utc).astimezone()
@@ -903,12 +904,13 @@ def build_record(
         "name": name,
         "updatedAt": now.astimezone().isoformat(),
         "ready": True,
-        "hasLocalStats": True,
+        "hasLocalStats": has_local_stats,
+        "hasPromptStats": has_local_stats,
         "todayPrompts": today["prompts"],
         "todaySessions": len(today["sessions"]) + today["sessionsEvicted"],
         "todayTotalTokens": today["tokens"],
         "todayTokensByModel": today["tokensByModel"],
-        "recentDays": recent,
+        "recentDays": recent if has_local_stats else [],
         "totalPrompts": stats["promptsTotal"],
         "totalSessions": len(stats["sessions"]) + stats["sessionsEvicted"],
         "activeDays": len(stats["activeDates"]) + stats["activeDatesEvicted"],
@@ -1003,8 +1005,8 @@ def validate_manifest(m: dict) -> list[str]:
     sources = m.get("sources")
     hooks = m.get("hooks") or {}
     collect_hook = m.get("collect") or hooks.get("collect")
-    if not sources and not collect_hook:
-        problems.append("needs sources[] or a collect hook")
+    if not sources and not collect_hook and not m.get("limits"):
+        problems.append("needs sources[] or a collect hook or a limits hook")
     for i, s in enumerate(sources or []):
         missing = REQUIRED_SOURCE_KEYS - set(s)
         if missing:
@@ -1076,10 +1078,12 @@ def provider_disabled(adapter_id: str) -> bool:
     return scan(cfg)
 
 
-def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> list:
+def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> dict:
+    """Normalize legacy arrays and optional record metadata; never arbitrary overrides."""
     script = manifest.get("limits")
+    empty = {"limits": []}
     if not script:
-        return []
+        return empty
     status, output, _stderr_tail, stderr_capped, returncode = _hook_run(
         script,
         adapter_dir,
@@ -1093,18 +1097,26 @@ def run_limits_hook(manifest: dict, adapter_dir: str, force: bool) -> list:
         )
     if status == "timeout":
         log(f"{manifest['id']} limits hook: timed out")
-        return []
+        return empty
     if status == "capped":
         log(
             f"{manifest['id']} limits hook: stdout capped at {HOOK_STDOUT_CAP} bytes"
         )
     if returncode != 0:  # optional by contract: exit 1 == no data
-        return []
+        return empty
     try:
         data = json.loads(output)
-        return data if isinstance(data, list) else []
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
-        return []
+        return empty
+    if isinstance(data, list):
+        return {"limits": data}
+    if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
+        return empty
+    result = {"limits": data["limits"]}
+    for key in ("tierLabel", "usageStatusText", "authHelpText"):
+        if isinstance(data.get(key), str):
+            result[key] = data[key]
+    return result
 
 
 # ---------------------------------------------------------------- main
@@ -1261,14 +1273,16 @@ def _run(wanted: set, excluded: set, args) -> int:
                         {**manifest, "collect": hook}, adapter_dir, args.force
                     ),
                 )
+            limits_result = run_limits_hook(manifest, adapter_dir, args.force)
             record = build_record(
                 aid,
                 manifest["name"],
                 stats,
-                run_limits_hook(manifest, adapter_dir, args.force),
-                status_text=manifest.get("usageStatusText", ""),
-                auth_help=manifest.get("authHelpText", ""),
-                tier_label=manifest.get("tierLabel", ""),
+                limits_result["limits"],
+                status_text=limits_result.get("usageStatusText", manifest.get("usageStatusText", "")),
+                auth_help=limits_result.get("authHelpText", manifest.get("authHelpText", "")),
+                tier_label=limits_result.get("tierLabel", manifest.get("tierLabel", "")),
+                has_local_stats=bool(manifest.get("sources") or hook),
             )
             # commit: cursors + counters move together, only on success
             for key, value in run_state.items():
