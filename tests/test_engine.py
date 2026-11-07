@@ -678,14 +678,14 @@ class TestHookBounding(unittest.TestCase):
         limits = ac.run_limits_hook(
             {"id": "x", "limits": "collect.sh"}, self.tmp, force=False
         )
-        self.assertEqual(limits, [{"kind": "tier"}])
+        self.assertEqual(limits, {"limits": [{"kind": "tier"}]})
         with open(self.script, "w") as fh:
             fh.write("#!/bin/sh\nexit 1\n")
         self.assertEqual(
             ac.run_limits_hook(
                 {"id": "x", "limits": "collect.sh"}, self.tmp, force=False
             ),
-            [],
+            {"limits": []},
         )
 
     def test_single_giant_line_capped(self):
@@ -1264,6 +1264,71 @@ class TestRunLock(unittest.TestCase):
             state["stats"]["ok"]["sessions"],
             [os.path.join(self.tmp, "sess")],
         )
+
+
+class TestLimitsOnly(unittest.TestCase):
+    def test_limits_only_manifest(self):
+        self.assertEqual(ac.validate_manifest({
+            "schemaVersion": 1, "id": "quota", "name": "Quota", "limits": "limits.py",
+        }), [])
+        self.assertTrue(ac.validate_manifest({
+            "schemaVersion": 1, "id": "quota", "name": "Quota",
+        }))
+
+    def test_limits_only_record_hides_local_charts(self):
+        rec = ac.build_record("quota", "Quota", ac.fresh_stats(), [], has_local_stats=False)
+        self.assertFalse(rec["hasLocalStats"])
+        self.assertFalse(rec["hasPromptStats"])
+        self.assertEqual(rec["recentDays"], [])
+        self.assertTrue(ac.build_record("pi", "Pi", ac.fresh_stats(), [])["hasLocalStats"])
+
+    def test_hook_object_metadata_is_whitelisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = os.path.join(directory, "limits.sh")
+            result = {"limits": [{"label": "Subscription", "percent": 0.42}],
+                      "tierLabel": "Pro", "usageStatusText": "", "authHelpText": "Help",
+                      "id": "stolen", "totalPrompts": 999}
+            with open(script, "w") as fh:
+                fh.write("#!/bin/sh\nprintf '%s' '" + json.dumps(result) + "'\n")
+            os.chmod(script, 0o700)
+            self.assertEqual(ac.run_limits_hook({"id": "quota", "limits": "limits.sh"}, directory, False),
+                             {k: v for k, v in result.items() if k in
+                              ("limits", "tierLabel", "usageStatusText", "authHelpText")})
+
+    def test_invalid_object_hook_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = os.path.join(directory, "limits.sh")
+            for payload in ({"limits": "wrong"}, {"tierLabel": "Pro"}, None):
+                with self.subTest(payload=payload):
+                    with open(script, "w") as fh:
+                        fh.write("#!/bin/sh\nprintf '%s' '" + json.dumps(payload) + "'\n")
+                    os.chmod(script, 0o700)
+                    self.assertEqual(ac.run_limits_hook({"id": "quota", "limits": "limits.sh"}, directory, False), {"limits": []})
+            with open(script, "w") as fh:
+                fh.write('#!/bin/sh\nprintf \'%s\' \'{"limits": [], "tierLabel": {"invalid": true}}\'\n')
+            self.assertEqual(ac.run_limits_hook({"id": "quota", "limits": "limits.sh"}, directory, False), {"limits": []})
+
+    def test_limits_only_through_engine(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = os.path.join(directory, "adapters", "quota")
+            os.makedirs(adapter)
+            with open(os.path.join(adapter, "manifest.json"), "w") as fh:
+                json.dump({"schemaVersion": 1, "id": "quota", "name": "Quota", "limits": "limits.sh", "tierLabel": "fallback"}, fh)
+            with open(os.path.join(adapter, "limits.sh"), "w") as fh:
+                fh.write('#!/bin/sh\nprintf \'%s\' \'{"limits": [{"label": "Quota", "percent": 0}], "tierLabel": "Live plan", "usageStatusText": "Live status"}\'\n')
+            os.chmod(os.path.join(adapter, "limits.sh"), 0o700)
+            usage = os.path.join(directory, "usage")
+            with patch.object(ac, "STATE_FILE", os.path.join(directory, "state.json")):
+                self.assertEqual(ac.main(["--adapters-dir", os.path.join(directory, "adapters"), "--usage-dir", usage, "quota"]), 0)
+            with open(os.path.join(usage, "quota.json")) as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["id"], "quota")
+            self.assertEqual(rec["tierLabel"], "Live plan")
+            self.assertEqual(rec["usageStatusText"], "Live status")
+            self.assertEqual(rec["limits"][0]["percent"], 0)
+            self.assertEqual(rec["recentDays"], [])
+            self.assertFalse(rec["hasPromptStats"])
 
 
 if __name__ == "__main__":

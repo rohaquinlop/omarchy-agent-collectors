@@ -107,6 +107,11 @@ manifest and reference them:
 
 - `collect` prints one canonical-event JSON object per line on stdout.
 - `limits` prints a limits-array JSON on stdout; exit 1 means "no data", not failure.
+  It may instead print an object with a `limits` array and optional string fields
+  `tierLabel`, `usageStatusText`, and `authHelpText`. These override the manifest's
+  defaults for that run; other fields cannot overwrite the record.
+- An adapter may contain only a `limits` hook, without `sources` or `collect`.
+  Such records mark local/prompt statistics unavailable and omit token-day charts.
 - Both run with the adapter directory as cwd; `FORCE=1` is set on forced runs.
 
 Validate your setup with `bin/agent-collectors --validate`. A broken adapter
